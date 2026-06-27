@@ -60,7 +60,13 @@ defmodule Realtime.Tenants.Authorization do
   Automatically uses RPC if the database connection is not in the same node
   """
   @spec get_read_authorizations(Policies.t(), pid(), t(), keyword()) ::
-          {:ok, Policies.t()} | {:error, any()} | {:error, :rls_policy_error, any()}
+          {:ok, Policies.t()}
+          | {:error, :rls_policy_error, Postgrex.Error.t()}
+          | {:error, :query_canceled, Postgrex.Error.t()}
+          | {:error, :missing_partition}
+          | {:error, :increase_connection_pool}
+          | {:error, :tenant_database_unavailable}
+          | {:error, any()}
   def get_read_authorizations(policies, db_conn, authorization_context, opts \\ [])
 
   def get_read_authorizations(policies, db_conn, authorization_context, opts) when node() == node(db_conn) do
@@ -108,8 +114,14 @@ defmodule Realtime.Tenants.Authorization do
 
   Automatically uses RPC if the database connection is not in the same node
   """
-  @spec get_write_authorizations(Policies.t(), pid(), __MODULE__.t(), keyword()) ::
-          {:ok, Policies.t()} | {:error, any()} | {:error, :rls_policy_error, any()}
+  @spec get_write_authorizations(Policies.t(), pid(), t(), keyword()) ::
+          {:ok, Policies.t()}
+          | {:error, :rls_policy_error, Postgrex.Error.t()}
+          | {:error, :query_canceled, Postgrex.Error.t()}
+          | {:error, :missing_partition}
+          | {:error, :increase_connection_pool}
+          | {:error, :tenant_database_unavailable}
+          | {:error, any()}
   def get_write_authorizations(policies, db_conn, authorization_context, opts \\ [])
 
   def get_write_authorizations(policies, db_conn, authorization_context, opts) when node() == node(db_conn) do
@@ -152,9 +164,8 @@ defmodule Realtime.Tenants.Authorization do
     end
   end
 
-  def get_write_authorizations(db_conn, authorization_context) do
-    get_write_authorizations(%Policies{}, db_conn, authorization_context)
-  end
+  def get_write_authorizations(db_conn, authorization_context),
+    do: get_write_authorizations(%Policies{}, db_conn, authorization_context)
 
   defp handle_policies_result(result, rate_counter) do
     case result do
@@ -164,6 +175,18 @@ defmodule Realtime.Tenants.Authorization do
       {:ok, {:error, %Postgrex.Error{} = error}} ->
         {:error, :rls_policy_error, error}
 
+      {:error, %Postgrex.Error{postgres: %{code: :invalid_parameter_value}} = error} ->
+        {:error, :rls_policy_error, error}
+
+      {:error, %Postgrex.Error{postgres: %{code: :query_canceled}} = error} ->
+        {:error, :query_canceled, error}
+
+      {:error, %Postgrex.Error{postgres: %{code: :check_violation, table: "messages"}}} ->
+        {:error, :missing_partition}
+
+      {:error, %Postgrex.Error{} = error} ->
+        {:error, :rls_policy_error, error}
+
       {:error, %ConnectionError{reason: :queue_timeout}} ->
         GenCounter.add(rate_counter.id)
         {:error, :increase_connection_pool}
@@ -171,6 +194,9 @@ defmodule Realtime.Tenants.Authorization do
       {:error, {:exit, _}} ->
         GenCounter.add(rate_counter.id)
         {:error, :increase_connection_pool}
+
+      {:error, %ConnectionError{}} ->
+        {:error, :tenant_database_unavailable}
 
       {:error, error} ->
         {:error, error}
@@ -228,15 +254,16 @@ defmodule Realtime.Tenants.Authorization do
             Message.changeset(%Message{}, %{topic: authorization_context.topic, extension: ext})
           end)
 
-        {:ok, messages} = Repo.insert_all_entries(transaction_conn, changesets, Message)
-        messages_by_extension = Map.new(messages, &{&1.extension, &1.id})
-
-        set_conn_config(transaction_conn, authorization_context)
-
-        policies = check_read_policies(transaction_conn, authorization_context, messages_by_extension, policies)
-
-        Postgrex.query!(transaction_conn, "ROLLBACK AND CHAIN", [])
-        policies
+        with {:ok, messages} <- Repo.insert_all_entries(transaction_conn, changesets, Message),
+             messages_by_extension = Map.new(messages, &{&1.extension, &1.id}),
+             _ = set_conn_config(transaction_conn, authorization_context),
+             {:ok, policies} <-
+               check_read_policies(transaction_conn, authorization_context, messages_by_extension, policies) do
+          Postgrex.query!(transaction_conn, "ROLLBACK AND CHAIN", [])
+          policies
+        else
+          {:error, reason} -> DBConnection.rollback(transaction_conn, reason)
+        end
       end,
       opts,
       metadata
@@ -253,10 +280,13 @@ defmodule Realtime.Tenants.Authorization do
       conn,
       fn transaction_conn ->
         set_conn_config(transaction_conn, authorization_context)
-        policies = check_write_policies(transaction_conn, authorization_context, extensions, policies)
 
-        Postgrex.query!(transaction_conn, "ROLLBACK AND CHAIN", [])
-        policies
+        with {:ok, policies} <- check_write_policies(transaction_conn, authorization_context, extensions, policies) do
+          Postgrex.query!(transaction_conn, "ROLLBACK AND CHAIN", [])
+          policies
+        else
+          {:error, reason} -> DBConnection.rollback(transaction_conn, reason)
+        end
       end,
       opts,
       metadata
@@ -279,33 +309,33 @@ defmodule Realtime.Tenants.Authorization do
     with {:ok, res} <- Repo.all(conn, query, Message) do
       returned_ids = MapSet.new(res, & &1.id)
 
-      Enum.reduce(@all_extensions, policies, fn extension, acc ->
-        can? =
-          Map.has_key?(messages_by_extension, extension) and
-            MapSet.member?(returned_ids, messages_by_extension[extension])
-
-        Policies.update_policies(acc, extension, :read, can?)
-      end)
+      # Only the requested extensions were inserted, so we only set read for those. Extensions that
+      # were not checked are left unevaluated (nil) so callers can tell "denied" (false) apart from
+      # "not checked yet" (nil).
+      {:ok,
+       Enum.reduce(messages_by_extension, policies, fn {extension, id}, acc ->
+         Policies.update_policies(acc, extension, :read, MapSet.member?(returned_ids, id))
+       end)}
     end
   end
 
   defp check_write_policies(conn, authorization_context, extensions, policies) do
-    Enum.reduce(@all_extensions, policies, fn extension, acc ->
+    Enum.reduce_while(@all_extensions, {:ok, policies}, fn extension, {:ok, acc} ->
       if extension in extensions do
         changeset = Message.changeset(%Message{}, %{topic: authorization_context.topic, extension: extension})
 
-        case Repo.insert(conn, changeset, Message, mode: :savepoint) do
+        case Repo.insert(conn, changeset, Message, mode: :savepoint, returning: false) do
           {:ok, _} ->
-            Policies.update_policies(acc, extension, :write, true)
+            {:cont, {:ok, Policies.update_policies(acc, extension, :write, true)}}
 
           {:error, %Postgrex.Error{postgres: %{code: :insufficient_privilege}}} ->
-            Policies.update_policies(acc, extension, :write, false)
+            {:cont, {:ok, Policies.update_policies(acc, extension, :write, false)}}
 
-          e ->
-            e
+          {:error, reason} ->
+            {:halt, {:error, reason}}
         end
       else
-        Policies.update_policies(acc, extension, :write, false)
+        {:cont, {:ok, Policies.update_policies(acc, extension, :write, false)}}
       end
     end)
   end

@@ -27,11 +27,17 @@ defmodule Realtime.Tenants.ReplicationConnection do
   alias Realtime.Adapters.Postgres.Protocol.Write
   alias Realtime.Api.Tenant
   alias Realtime.Database
+  alias Realtime.GenCounter
+  alias Realtime.RateCounter
   alias Realtime.Telemetry
-  alias Realtime.Tenants.BatchBroadcast
+  alias Realtime.Tenants
   alias Realtime.Tenants.Cache
+  alias Realtime.Tenants.Connect
+  alias RealtimeWeb.RealtimeChannel
+  alias RealtimeWeb.Socket.UserBroadcast
+  alias RealtimeWeb.TenantBroadcaster
 
-  @default_query_timeout 30_000
+  @default_query_timeout :timer.minutes(4)
 
   @type t :: %__MODULE__{
           tenant_id: String.t(),
@@ -40,9 +46,8 @@ defmodule Realtime.Tenants.ReplicationConnection do
             :disconnected
             | :check_replication_slot
             | :create_publication
-            | :check_publication
             | :validate_publication
-            | :create_slot
+            | :create_replication_slot
             | :start_replication_slot
             | :streaming,
           publication_name: String.t(),
@@ -121,33 +126,54 @@ defmodule Realtime.Tenants.ReplicationConnection do
     end
   end
 
+  def ready?(tenant_id) do
+    RealtimeWeb.Endpoint.subscribe(Connect.syn_topic(tenant_id))
+    # We do a lookup after subscribing because we could've missed a message while subscribing
+    case Connect.replication_status(tenant_id) do
+      {:ok, _} ->
+        true
+
+      _ ->
+        # Wait for up to 5 seconds for the ready event
+        receive do
+          %{event: "ready", payload: %{replication_conn: conn}} when is_pid(conn) ->
+            true
+        after
+          5_000 -> false
+        end
+    end
+  after
+    RealtimeWeb.Endpoint.unsubscribe(Connect.syn_topic(tenant_id))
+  end
+
   @spec health_check(pid(), timeout()) :: :ok | no_return()
   def health_check(pid, timeout), do: Postgrex.ReplicationConnection.call(pid, :health_check, timeout)
 
   def start_link(%__MODULE__{tenant_id: tenant_id} = attrs) do
     tenant = Cache.get_tenant_by_external_id(tenant_id)
-    connection_opts = Database.from_tenant(tenant, "realtime_broadcast_changes", :stop)
 
-    connection_opts =
-      [
-        name: {:via, Registry, {Realtime.Registry.Unique, {__MODULE__, tenant_id}}},
-        hostname: connection_opts.hostname,
-        username: connection_opts.username,
-        password: connection_opts.password,
-        database: connection_opts.database,
-        port: connection_opts.port,
-        socket_options: connection_opts.socket_options,
-        ssl: connection_opts.ssl,
-        sync_connect: true,
-        auto_reconnect: false,
-        parameters: [application_name: "realtime_replication_connection"]
-      ]
+    with {:ok, db_settings} <- Database.from_tenant(tenant, "realtime_broadcast_changes", :stop) do
+      connection_opts =
+        [
+          name: {:via, Registry, {Realtime.Registry.Unique, {__MODULE__, tenant_id}}},
+          hostname: db_settings.hostname,
+          username: db_settings.username,
+          password: db_settings.password,
+          database: db_settings.database,
+          port: db_settings.port,
+          socket_options: db_settings.socket_options,
+          ssl: db_settings.ssl,
+          sync_connect: true,
+          auto_reconnect: false,
+          parameters: [application_name: "realtime_replication_connection"]
+        ]
 
-    case Postgrex.ReplicationConnection.start_link(__MODULE__, attrs, connection_opts) do
-      {:ok, pid} -> {:ok, pid}
-      {:error, {:already_started, pid}} -> {:ok, pid}
-      {:error, {:bad_return_from_init, {:stop, error}}} -> {:error, error}
-      {:error, error} -> {:error, error}
+      case Postgrex.ReplicationConnection.start_link(__MODULE__, attrs, connection_opts) do
+        {:ok, pid} -> {:ok, pid}
+        {:error, {:already_started, pid}} -> {:ok, pid}
+        {:error, {:bad_return_from_init, {:stop, error}}} -> {:error, error}
+        {:error, error} -> {:error, error}
+      end
     end
   end
 
@@ -157,13 +183,19 @@ defmodule Realtime.Tenants.ReplicationConnection do
     Logger.metadata(external_id: tenant_id, project: tenant_id)
     Process.monitor(monitored_pid)
 
+    slot_name = replication_slot_name(@schema, @table)
+
     {:ok, _watchdog_pid} =
-      Realtime.Tenants.ReplicationConnection.Watchdog.start_link(parent_pid: self(), tenant_id: tenant_id)
+      Realtime.Tenants.ReplicationConnection.Watchdog.start_link(
+        parent_pid: self(),
+        tenant_id: tenant_id,
+        replication_slot_name: slot_name
+      )
 
     state = %{
       state
       | publication_name: publication_name(@schema, @table),
-        replication_slot_name: replication_slot_name(@schema, @table)
+        replication_slot_name: slot_name
     }
 
     Logger.info("Initializing connection with the status: #{inspect(state, pretty: true)}")
@@ -192,20 +224,6 @@ defmodule Realtime.Tenants.ReplicationConnection do
   end
 
   def handle_result([%Postgrex.Result{num_rows: 0}], %__MODULE__{step: :check_replication_slot} = state) do
-    %__MODULE__{
-      output_plugin: output_plugin,
-      replication_slot_name: replication_slot_name,
-      step: :check_replication_slot
-    } = state
-
-    Logger.info("Create replication slot #{replication_slot_name} using plugin #{output_plugin}")
-
-    query = "CREATE_REPLICATION_SLOT #{replication_slot_name} TEMPORARY LOGICAL #{output_plugin} NOEXPORT_SNAPSHOT"
-
-    {:query, query, [timeout: state.query_timeout], %{state | step: :check_publication}}
-  end
-
-  def handle_result([%Postgrex.Result{}], %__MODULE__{step: :check_publication} = state) do
     %__MODULE__{publication_name: publication_name} = state
 
     Logger.info("Check publication #{publication_name} for table #{@schema}.#{@table} exists")
@@ -220,7 +238,7 @@ defmodule Realtime.Tenants.ReplicationConnection do
     Logger.info("Create publication #{publication_name} for table #{@schema}.#{@table}")
     query = "CREATE PUBLICATION #{publication_name} FOR TABLE #{@schema}.#{@table}"
 
-    {:query, query, [timeout: state.query_timeout], %{state | step: :start_replication_slot}}
+    {:query, query, [timeout: state.query_timeout], %{state | step: :create_replication_slot}}
   end
 
   def handle_result([%Postgrex.Result{num_rows: 1}], %__MODULE__{step: :create_publication} = state) do
@@ -246,14 +264,46 @@ defmodule Realtime.Tenants.ReplicationConnection do
       end)
 
     if valid_tables and rows != [] do
-      {:query, "SELECT 1", [timeout: state.query_timeout], %{state | step: :start_replication_slot}}
+      {:query, "SELECT 1", [timeout: state.query_timeout], %{state | step: :create_replication_slot}}
     else
       query =
         "DROP PUBLICATION IF EXISTS #{publication_name}; CREATE PUBLICATION #{publication_name} FOR TABLE #{@schema}.#{@table}"
 
       Logger.warning("Publication #{publication_name} contains unexpected tables. Recreating...")
-      {:query, query, [timeout: state.query_timeout], %{state | step: :start_replication_slot}}
+      {:query, query, [timeout: state.query_timeout], %{state | step: :create_replication_slot}}
     end
+  end
+
+  def handle_result(%Postgrex.Error{postgres: %{message: message}}, %__MODULE__{step: :create_replication_slot}) do
+    {:disconnect, "Error creating publication: #{message}"}
+  end
+
+  def handle_result(%Postgrex.Error{message: message}, %__MODULE__{step: :create_replication_slot}) do
+    {:disconnect, "Error creating publication: #{message}"}
+  end
+
+  def handle_result(results, %__MODULE__{step: :create_replication_slot} = state) do
+    %__MODULE__{
+      output_plugin: output_plugin,
+      replication_slot_name: replication_slot_name
+    } = state
+
+    case Enum.find(results, &match?(%Postgrex.Error{}, &1)) do
+      %Postgrex.Error{} = error ->
+        {:disconnect, "Error creating publication: #{error.message}"}
+
+      nil ->
+        Logger.info("Create replication slot #{replication_slot_name} using plugin #{output_plugin}")
+
+        query = "CREATE_REPLICATION_SLOT #{replication_slot_name} TEMPORARY LOGICAL #{output_plugin} NOEXPORT_SNAPSHOT"
+
+        {:query, query, [timeout: state.query_timeout], %{state | step: :start_replication_slot}}
+    end
+  end
+
+  def handle_result(%Postgrex.Error{postgres: %{pg_code: pg_code}}, %__MODULE__{step: :start_replication_slot})
+      when pg_code in ~w(53300 53400) do
+    {:disconnect, :max_wal_senders_reached}
   end
 
   def handle_result(%Postgrex.Error{postgres: %{message: message}}, %__MODULE__{step: :start_replication_slot} = _state) do
@@ -277,7 +327,7 @@ defmodule Realtime.Tenants.ReplicationConnection do
       } = state
 
       Logger.info(
-        "Starting stream replication for slot #{replication_slot_name} using publication #{publication_name} and protocol version #{proto_version}"
+        "#{inspect(self())} Starting stream replication for slot #{replication_slot_name} using publication #{publication_name} and protocol version #{proto_version}"
       )
 
       query =
@@ -359,21 +409,36 @@ defmodule Realtime.Tenants.ReplicationConnection do
 
     with %{columns: columns} <- Map.get(relations, relation_id),
          to_broadcast = tuple_to_map(tuple_data, columns),
-         {:ok, payload} <- get_or_error(to_broadcast, "payload", :payload_missing),
          {:ok, inserted_at} <- get_or_error(to_broadcast, "inserted_at", :inserted_at_missing),
          {:ok, event} <- get_or_error(to_broadcast, "event", :event_missing),
          {:ok, id} <- get_or_error(to_broadcast, "id", :id_missing),
          {:ok, topic} <- get_or_error(to_broadcast, "topic", :topic_missing),
          {:ok, private} <- get_or_error(to_broadcast, "private", :private_missing),
+         {:ok, encoding, body} <- pick_payload(to_broadcast),
          %Tenant{} = tenant <- Cache.get_tenant_by_external_id(tenant_id),
-         broadcast_message = %{
-           id: id,
-           topic: topic,
-           event: event,
-           private: private,
-           payload: Jason.Fragment.new(payload)
-         },
-         :ok <- BatchBroadcast.broadcast(nil, tenant, %{messages: [broadcast_message]}, true) do
+         :ok <- Tenants.validate_payload_size(tenant, body),
+         events_per_second_rate = Tenants.events_per_second_rate(tenant),
+         :ok <- check_rate_limit(events_per_second_rate) do
+      tenant_topic = Tenants.tenant_topic(tenant, topic, not private)
+
+      broadcast = %UserBroadcast{
+        topic: tenant_topic,
+        user_event: event,
+        user_payload: body,
+        user_payload_encoding: encoding,
+        metadata: %{"id" => id}
+      }
+
+      GenCounter.add(events_per_second_rate.id)
+
+      TenantBroadcaster.pubsub_broadcast(
+        tenant.external_id,
+        tenant_topic,
+        broadcast,
+        RealtimeChannel.MessageDispatcher,
+        :broadcast
+      )
+
       latency_inserted_at = NaiveDateTime.utc_now(:microsecond) |> NaiveDateTime.diff(inserted_at, :microsecond)
 
       Telemetry.execute(
@@ -384,11 +449,6 @@ defmodule Realtime.Tenants.ReplicationConnection do
 
       {:noreply, state}
     else
-      {:error, %Ecto.Changeset{valid?: false} = changeset} ->
-        error = Ecto.Changeset.traverse_errors(changeset, &elem(&1, 0))
-        log_error("UnableToBroadcastChanges", error)
-        {:noreply, state}
-
       {:error, error} ->
         log_error("UnableToBroadcastChanges", error)
         {:noreply, state}
@@ -438,10 +498,21 @@ defmodule Realtime.Tenants.ReplicationConnection do
     end)
   end
 
+  defp check_rate_limit(events_per_second_rate) do
+    case RateCounter.get(events_per_second_rate) do
+      {:ok, %{limit: %{triggered: true}}} -> {:error, :too_many_requests}
+      _ -> :ok
+    end
+  end
+
   defp get_or_error(map, key, error_type) do
     case Map.get(map, key) do
       nil -> {:error, error_type}
       value -> {:ok, value}
     end
   end
+
+  defp pick_payload(%{"binary_payload" => bin}) when is_binary(bin), do: {:ok, :binary, bin}
+  defp pick_payload(%{"payload" => json}) when is_binary(json), do: {:ok, :json, json}
+  defp pick_payload(_), do: {:error, :payload_missing}
 end

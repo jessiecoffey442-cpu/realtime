@@ -4,7 +4,7 @@ defmodule Realtime.MixProject do
   def project do
     [
       app: :realtime,
-      version: "2.80.7",
+      version: "2.112.0",
       elixir: "~> 1.18",
       elixirc_paths: elixirc_paths(Mix.env()),
       start_permanent: Mix.env() == :prod,
@@ -53,11 +53,12 @@ defmodule Realtime.MixProject do
   # Type `mix help deps` for examples and options.
   defp deps do
     [
-      {:phoenix, override: true, github: "supabase/phoenix", branch: "feat/presence-custom-dispatcher-1.7.19"},
+      phoenix_dep(),
       {:phoenix_ecto, "~> 4.4.0"},
       {:ecto_sql, "~> 3.11"},
       {:ecto_psql_extras, "~> 0.8"},
-      {:postgrex, "~> 0.21.0"},
+      {:postgrex, "~> 0.22"},
+      {:db_connection, github: "elixir-ecto/db_connection", branch: "master", override: true},
       {:phoenix_html, "~> 3.2"},
       {:phoenix_live_view, "~> 0.18"},
       {:phoenix_live_reload, "~> 1.2", only: :dev},
@@ -69,7 +70,7 @@ defmodule Realtime.MixProject do
       {:telemetry_poller, "~> 1.0"},
       {:gettext, "~> 0.19"},
       {:jason, "~> 1.3"},
-      {:plug_cowboy, "~> 2.6"},
+      {:plug_cowboy, "~> 2.8"},
       {:libcluster, "~> 3.3"},
       {:libcluster_postgres, "~> 0.2"},
       {:uuid, "~> 1.1"},
@@ -79,12 +80,12 @@ defmodule Realtime.MixProject do
       {:peep, "~> 4.3", override: true},
       {:joken, "~> 2.5.0"},
       {:nimble_zta, "~> 0.1"},
-      {:ex_json_schema, "~> 0.7"},
+      {:ex_json_schema, "~> 0.11"},
       {:recon, "~> 2.5"},
       {:mint, "~> 1.4"},
       {:logflare_logger_backend, "~> 0.11"},
       {:syn, "~> 3.3"},
-      {:beacon, path: "./beacon"},
+      {:forum, path: "./forum"},
       {:cachex, "~> 4.0"},
       {:open_api_spex, "~> 3.16"},
       {:corsica, "~> 2.0"},
@@ -95,7 +96,7 @@ defmodule Realtime.MixProject do
       {:opentelemetry_phoenix, "~> 2.0"},
       {:opentelemetry_cowboy, "~> 1.0"},
       {:opentelemetry_ecto, "~> 1.2"},
-      {:gen_rpc, git: "https://github.com/supabase/gen_rpc.git", ref: "5382a0f2689a4cb8838873a2173928281dbe5002"},
+      {:gen_rpc, git: "https://github.com/emqx/gen_rpc.git", tag: "3.6.1"},
       {:req, "~> 0.5"},
       {:mimic, "~> 1.0", only: :test},
       {:floki, ">= 0.30.0", only: :test},
@@ -112,6 +113,14 @@ defmodule Realtime.MixProject do
     ]
   end
 
+  defp phoenix_dep do
+    if path = System.get_env("PHOENIX_PATH") do
+      {:phoenix, path: path, override: true}
+    else
+      {:phoenix, override: true, github: "supabase/phoenix", branch: "feat/presence-custom-dispatcher-1.7.19"}
+    end
+  end
+
   # Aliases are shortcuts or tasks specific to the current project.
   # For example, to install project dependencies and perform other setup tasks, run:
   #
@@ -121,20 +130,16 @@ defmodule Realtime.MixProject do
   defp aliases do
     [
       setup: ["deps.get", "ecto.setup", "cmd npm install --prefix assets"],
-      "ecto.setup": ["ecto.create", "ecto.migrate", "run priv/repo/dev_seeds.exs"],
+      "ecto.setup": ["ecto.create", "ecto.migrate", "seed"],
       "ecto.reset": ["ecto.drop", "ecto.setup"],
-      test: [
+      seed: ["run priv/repo/dev_seeds.exs"],
+      "test.setup": [
         "cmd epmd -daemon",
         "ecto.create --quiet",
-        "ecto.migrate --migrations-path=priv/repo/migrations",
-        "test"
+        "ecto.migrate"
       ],
-      "test.partitioned": [
-        "cmd epmd -daemon",
-        "ecto.create --quiet",
-        "ecto.migrate --migrations-path=priv/repo/migrations",
-        "test --partitions 4"
-      ],
+      test: ["test.setup", "test"],
+      "test.partitioned": ["test.setup", "test --partitions 4"],
       "assets.deploy": ["esbuild default --minify", "tailwind default --minify", "phx.digest"]
     ]
   end

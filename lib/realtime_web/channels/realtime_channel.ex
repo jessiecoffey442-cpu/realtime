@@ -5,7 +5,6 @@ defmodule RealtimeWeb.RealtimeChannel do
   use RealtimeWeb, :channel
   use RealtimeWeb.RealtimeChannel.Logging
 
-  alias RealtimeWeb.SocketDisconnect
   alias DBConnection.Backoff
 
   alias Realtime.Api.Tenant
@@ -31,11 +30,14 @@ defmodule RealtimeWeb.RealtimeChannel do
   alias RealtimeWeb.RealtimeChannel.Tracker
 
   @confirm_token_ms_interval :timer.minutes(5)
+  @replication_ready_check_interval 10
   @fullsweep_after Application.compile_env!(:realtime, :websocket_fullsweep_after)
 
   @impl true
   def join("realtime:", _params, socket) do
-    log_error(socket, "TopicNameRequired", "You must provide a topic name")
+    socket
+    |> log_error("TopicNameRequired", "You must provide a topic name")
+    |> join_error()
   end
 
   def join("realtime:" <> sub_topic = topic, params, socket) do
@@ -52,30 +54,26 @@ defmodule RealtimeWeb.RealtimeChannel do
     Logger.metadata(external_id: tenant_id, project: tenant_id)
     Logger.put_process_level(self(), log_level)
 
-    presence_enabled? =
-      case get_in(params, ["config", "presence", "enabled"]) do
-        enabled when is_boolean(enabled) -> enabled
-        _ -> false
+    join =
+      case Join.validate(params) do
+        {:ok, join} ->
+          join
+
+        {:error, :invalid_join_payload, errors} ->
+          log_params = params |> Map.put("access_token", "<redacted>") |> Map.put("user_token", "<redacted>")
+          log_error(socket, "InvalidJoinPayload", %{changeset_errors: errors, params: log_params})
+          %Join{} |> Join.changeset(params) |> Ecto.Changeset.apply_changes()
       end
 
     socket =
       socket
       |> assign_access_token(params)
-      |> assign(:private?, !!params["config"]["private"])
+      |> assign(:private?, Join.private?(join))
       |> assign(:policies, nil)
-      |> assign(:presence_enabled?, presence_enabled?)
-
-    case Join.validate(params) do
-      {:ok, _join} ->
-        nil
-
-      {:error, :invalid_join_payload, errors} ->
-        log_params = params |> Map.put("access_token", "<redacted>") |> Map.put("user_token", "<redacted>")
-        log_error(socket, "InvalidJoinPayload", %{changeset_errors: errors, params: log_params})
-    end
+      |> assign(:presence_enabled?, Join.presence_enabled?(join))
 
     with :ok <- SignalHandler.shutdown_in_progress?(),
-         %Tenant{} = tenant <- Cache.get_tenant_by_external_id(tenant_id),
+         {:ok, tenant} <- Cache.fetch_tenant_by_external_id(tenant_id),
          socket =
            assign(socket, :presence_enabled?, presence_enabled?(socket.assigns.presence_enabled?, tenant)),
          :ok <- only_private?(tenant, socket),
@@ -90,6 +88,20 @@ defmodule RealtimeWeb.RealtimeChannel do
            maybe_replay_messages(params["config"], sub_topic, db_conn, tenant_id, socket.assigns.private?) do
       tenant_topic = Tenants.tenant_topic(tenant_id, sub_topic, !socket.assigns.private?)
 
+      # presence.read gate carried in the fastlane metadata so the dispatcher can withhold
+      # presence_diff from members denied presence.read:
+      #   * public channel (no policies) -> true (no presence authorization, always receive diffs)
+      #   * private + presence enabled at join -> the authorized presence.read value (true/false)
+      #   * private + presence not enabled -> nil (read not evaluated yet). The dispatcher routes
+      #     these diffs to the channel process (handle_info) instead of fastlaning, where presence.read
+      #     is consulted at delivery time (it is authorized on-demand when presence is auto-enabled via
+      #     a track message - see PresenceHandler).
+      presence_read? =
+        case socket.assigns.policies do
+          nil -> true
+          %Policies{presence: %{read: read}} -> read
+        end
+
       # fastlane subscription
       metadata =
         MessageDispatcher.fastlane_metadata(
@@ -98,12 +110,14 @@ defmodule RealtimeWeb.RealtimeChannel do
           topic,
           log_level,
           tenant_id,
-          replayed_message_ids
+          replayed_message_ids,
+          presence_read?
         )
 
       RealtimeWeb.Endpoint.subscribe(tenant_topic, metadata: metadata)
+      RealtimeWeb.Endpoint.subscribe("realtime:operations:" <> tenant_id, metadata: metadata)
 
-      Phoenix.PubSub.subscribe(Realtime.PubSub, "realtime:operations:" <> tenant_id)
+      replication_ready_opt_in? = !!get_in(params, ["config", "broadcast", "replication_ready"])
 
       is_new_api = new_api?(params)
       presence_enabled? = socket.assigns.presence_enabled?
@@ -124,17 +138,29 @@ defmodule RealtimeWeb.RealtimeChannel do
       state = %{postgres_changes: add_id_to_postgres_changes(pg_change_params)}
 
       assigns = %{
-        ack_broadcast: !!params["config"]["broadcast"]["ack"],
+        ack_broadcast: Join.ack_broadcast?(join),
         confirm_token_ref: confirm_token_ref,
         is_new_api: is_new_api,
         pg_sub_ref: nil,
         pg_change_params: pg_change_params,
-        presence_key: presence_key(params),
-        self_broadcast: !!params["config"]["broadcast"]["self"],
+        presence_key: Join.presence_key(join),
+        self_broadcast: Join.self_broadcast?(join),
         tenant_topic: tenant_topic,
         channel_name: sub_topic,
         presence_enabled?: presence_enabled?
       }
+
+      assigns =
+        if replication_ready_opt_in? do
+          Process.send_after(self(), :notify_replication_ready, @replication_ready_check_interval)
+
+          Map.merge(assigns, %{
+            replication_ready_notified?: false,
+            replication_ready_deadline: System.monotonic_time(:millisecond) + replication_ready_timeout()
+          })
+        else
+          assigns
+        end
 
       socket =
         socket
@@ -146,7 +172,6 @@ defmodule RealtimeWeb.RealtimeChannel do
       if presence_enabled?, do: send(self(), :sync_presence)
 
       UsersCounter.add(transport_pid, tenant_id)
-      SocketDisconnect.add(tenant_id, socket)
 
       {:ok, state, assign(socket, assigns)}
     else
@@ -191,6 +216,12 @@ defmodule RealtimeWeb.RealtimeChannel do
       {:error, :tenant_database_unavailable} ->
         log_error(socket, "UnableToConnectToProject", "Realtime was unable to connect to the project database")
 
+      {:error, :query_canceled, error} ->
+        log_error(socket, "QueryCanceled", error)
+
+      {:error, :missing_partition} ->
+        log_error(socket, "MissingPartition", "Realtime was unable to find the expected messages partition")
+
       {:error, :rpc_error, :timeout} ->
         log_error(socket, "TimeoutOnRpcCall", "Node request timeout")
 
@@ -213,6 +244,7 @@ defmodule RealtimeWeb.RealtimeChannel do
         log_error(socket, "PrivateOnly", "This project only allows private channels")
 
       {:error, :tenant_not_found} ->
+        send(transport_pid, %Phoenix.Socket.Broadcast{event: "disconnect"})
         log_error(socket, "TenantNotFound", "Tenant with the given ID does not exist")
 
       {:error, :tenant_suspended} ->
@@ -244,6 +276,11 @@ defmodule RealtimeWeb.RealtimeChannel do
         log_error(socket, "UnknownErrorOnChannel", error)
         {:error, %{reason: "Unknown Error on Channel"}}
     end
+    |> join_error()
+  rescue
+    e ->
+      log_error(socket, "UnknownErrorOnChannel", Exception.message(e))
+      |> join_error()
   end
 
   @impl true
@@ -277,6 +314,27 @@ defmodule RealtimeWeb.RealtimeChannel do
     pg_sub_ref = postgres_subscribe()
 
     {:noreply, assign(socket, %{pg_sub_ref: pg_sub_ref})}
+  end
+
+  def handle_info(:notify_replication_ready, %{assigns: %{replication_ready_notified?: true}} = socket) do
+    {:noreply, socket}
+  end
+
+  def handle_info(:notify_replication_ready, socket) do
+    %{assigns: %{tenant: tenant_id, channel_name: channel_name, replication_ready_deadline: deadline}} = socket
+
+    cond do
+      match?({:ok, _replication_conn}, Connect.replication_status(tenant_id)) ->
+        push_system_message("system", socket, "ok", "Replication connection established", channel_name)
+        {:noreply, assign(socket, :replication_ready_notified?, true)}
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        shutdown_response(socket, "Replication connection was not established in time")
+
+      true ->
+        Process.send_after(self(), :notify_replication_ready, @replication_ready_check_interval)
+        {:noreply, socket}
+    end
   end
 
   def handle_info(_msg, %{assigns: %{policies: %Policies{broadcast: %BroadcastPolicies{read: false}}}} = socket) do
@@ -368,12 +426,6 @@ defmodule RealtimeWeb.RealtimeChannel do
     end
   end
 
-  def handle_info(:disconnect, %{assigns: %{channel_name: channel_name}} = socket) do
-    Logger.info("Received operational call to disconnect channel")
-    push_system_message("system", socket, "ok", "Server requested disconnect", channel_name)
-    {:stop, :shutdown, socket}
-  end
-
   def handle_info(:sync_presence, %{assigns: %{presence_enabled?: true}} = socket) do
     case PresenceHandler.sync(socket) do
       :ok ->
@@ -385,6 +437,16 @@ defmodule RealtimeWeb.RealtimeChannel do
   end
 
   def handle_info(:sync_presence, socket), do: {:noreply, socket}
+
+  # presence_diff for a socket whose presence.read was not authorized at join (presence disabled
+  # then) is routed here by the dispatcher instead of fastlaned. Deliver it only if this socket is
+  # authorized for presence.read (authorized on-demand when presence was auto-enabled via track),
+  # otherwise drop it.
+  def handle_info({:authorize_presence_diff, %Phoenix.Socket.Broadcast{} = msg}, socket) do
+    if can_read_presence?(socket), do: push(socket, "presence_diff", msg.payload)
+    {:noreply, socket}
+  end
+
   def handle_info(_, socket), do: {:noreply, socket}
 
   @impl true
@@ -421,6 +483,10 @@ defmodule RealtimeWeb.RealtimeChannel do
       {:error, :payload_size_exceeded} ->
         shutdown_response(socket, "Track message size exceeded")
 
+      {:error, :invalid_payload} ->
+        log_error(socket, "InvalidPresencePayload", :invalid_payload)
+        {:reply, {:error, %{reason: "Presence track payload must be a map"}}, socket}
+
       {:error, error} ->
         log_error(socket, "UnableToHandlePresence", error)
         {:reply, :error, socket}
@@ -440,6 +506,10 @@ defmodule RealtimeWeb.RealtimeChannel do
 
       {:error, :payload_size_exceeded} ->
         shutdown_response(socket, "Track message size exceeded")
+
+      {:error, :invalid_payload} ->
+        log_error(socket, "InvalidPresencePayload", :invalid_payload)
+        {:reply, {:error, %{reason: "Presence track payload must be a map"}}, socket}
 
       {:error, error} ->
         log_error(socket, "UnableToHandlePresence", error)
@@ -471,13 +541,17 @@ defmodule RealtimeWeb.RealtimeChannel do
       }
     } = socket
 
+    # Keep track of the policies evaluated with the previous token so we can detect revoked permissions
+    previous_policies = socket.assigns.policies
+
     # Update token and reset policies
     socket = assign(socket, %{access_token: refresh_token, policies: nil})
 
     with {:ok, claims, confirm_token_ref} <- confirm_token(socket),
          socket = assign_authorization_context(socket, channel_name, claims),
          {:ok, db_conn} <- Connect.lookup_or_start_connection(tenant_id),
-         {:ok, socket} <- maybe_assign_policies(channel_name, db_conn, socket) do
+         {:ok, socket} <- maybe_assign_policies(channel_name, db_conn, socket),
+         :ok <- check_read_permissions_revoked(previous_policies, socket.assigns.policies) do
       Helpers.cancel_timer(pg_sub_ref)
       pg_change_params = Enum.map(pg_change_params, &Map.put(&1, :claims, claims))
 
@@ -498,20 +572,34 @@ defmodule RealtimeWeb.RealtimeChannel do
       {:error, reason, msg} when reason in ~w(unauthorized expired_token token_malformed)a ->
         shutdown_response(socket, msg)
 
+      {:error, :read_permissions_revoked} ->
+        shutdown_response(socket, "You no longer have permission to read from this Channel topic: #{channel_name}")
+
       {:error, :missing_claims} ->
         shutdown_response(socket, "Fields `role` and `exp` are required in JWT")
 
       {:error, :unable_to_set_policies, _msg} ->
         shutdown_response(socket, "Realtime was unable to connect to the project database")
 
-      {:error, error} ->
-        shutdown_response(socket, inspect(error))
+      {:error, :tenant_database_unavailable} ->
+        shutdown_response(socket, "Realtime was unable to connect to the project database")
+
+      {:error, :query_canceled, error} ->
+        log_error(socket, "QueryCanceled", error)
+        shutdown_response(socket, "Query was cancelled, please try again")
+
+      {:error, :missing_partition} ->
+        log_error(socket, "MissingPartition", "Realtime was unable to find the expected messages partition")
+        shutdown_response(socket, "Realtime was unable to connect to the project database")
 
       {:error, :rpc_error, :timeout} ->
         shutdown_response(socket, "Node request timeout")
 
       {:error, :rpc_error, reason} ->
         shutdown_response(socket, "RPC call error: " <> inspect(reason))
+
+      {:error, error} ->
+        shutdown_response(socket, inspect(error))
     end
   end
 
@@ -632,13 +720,6 @@ defmodule RealtimeWeb.RealtimeChannel do
 
   defp count(%{assigns: %{rate_counter: counter}}), do: GenCounter.add(counter.id)
 
-  defp presence_key(params) do
-    case params["config"]["presence"]["key"] do
-      key when is_binary(key) and key != "" -> key
-      _ -> UUID.uuid1()
-    end
-  end
-
   defp assign_access_token(%{assigns: %{tenant_token: tenant_token}} = socket, params) do
     access_token = Map.get(params, "access_token") || Map.get(params, "user_token")
 
@@ -697,6 +778,10 @@ defmodule RealtimeWeb.RealtimeChannel do
     push_system_message("system", socket, "error", message, channel_name)
     maybe_log_warning(socket, "ChannelShutdown", message)
     {:stop, :normal, socket}
+  end
+
+  defp replication_ready_timeout do
+    Application.fetch_env!(:realtime, :replication_ready_timeout)
   end
 
   defp push_system_message(extension, socket, status, error, channel_name)
@@ -842,12 +927,29 @@ defmodule RealtimeWeb.RealtimeChannel do
 
         {:error, :unauthorized, "You do not have permissions to read from this Channel topic: #{topic}"}
 
-      {:error, error} ->
+      {:error, %_{} = error} ->
         {:error, :unable_to_set_policies, error}
+
+      other ->
+        other
     end
   end
 
   defp maybe_assign_policies(_, _, socket), do: {:ok, assign(socket, policies: nil)}
+
+  # Detects read permissions that were granted under the previous token but are no longer allowed
+  # after re-evaluating the policies with the new token. When that happens we disconnect the channel.
+  defp check_read_permissions_revoked(%Policies{} = previous, %Policies{} = current) do
+    if read_revoked?(previous.broadcast.read, current.broadcast.read) or
+         read_revoked?(previous.presence.read, current.presence.read),
+       do: {:error, :read_permissions_revoked},
+       else: :ok
+  end
+
+  defp check_read_permissions_revoked(_previous, _current), do: :ok
+
+  defp read_revoked?(true, false), do: true
+  defp read_revoked?(_previous, _current), do: false
 
   defp only_private?(tenant, %{assigns: %{private?: private?}}) do
     if tenant.private_only and !private? do
@@ -889,5 +991,17 @@ defmodule RealtimeWeb.RealtimeChannel do
     client_enabled? || tenant_enabled
   end
 
+  defp can_read_presence?(%{assigns: %{policies: %Policies{presence: %{read: true}}}}), do: true
+  defp can_read_presence?(_socket), do: false
+
   defp max_heap_size(), do: :persistent_term.get({RealtimeWeb.UserSocket, :websocket_max_heap_size})
+
+  defp join_error({:error, _} = error) do
+    Process.sleep(channel_error_backoff_ms())
+    error
+  end
+
+  defp join_error(other), do: other
+
+  defp channel_error_backoff_ms(), do: :persistent_term.get({__MODULE__, :channel_error_backoff_ms})
 end

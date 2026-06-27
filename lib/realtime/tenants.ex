@@ -3,9 +3,8 @@ defmodule Realtime.Tenants do
   Everything to do with Tenants.
   """
 
-  require Logger
+  use Realtime.Logs
 
-  alias Realtime.Api
   alias Realtime.Api.Tenant
   alias Realtime.Database
   alias Realtime.RateCounter
@@ -96,11 +95,12 @@ defmodule Realtime.Tenants do
 
       connected_cluster when is_integer(connected_cluster) ->
         tenant = Cache.get_tenant_by_external_id(external_id)
-        result? = Migrations.run_migrations(tenant)
+        healthy = not Migrations.run_migrations?(tenant)
+        if not healthy, do: Migrations.run_migrations_async(tenant)
 
         {:ok,
          %{
-           healthy: result? == :ok || result? == :noop,
+           healthy: healthy,
            db_connected: false,
            replication_connected: false,
            connected_cluster: connected_cluster,
@@ -108,6 +108,45 @@ defmodule Realtime.Tenants do
            node: node
          }}
     end
+  end
+
+  @doc """
+  Creates the `realtime.messages` partitions for the days around today.
+  """
+  @spec create_messages_partitions(pid()) :: :ok
+  def create_messages_partitions(db_conn_pid) do
+    Logger.info("Creating partitions for realtime.messages")
+    today = Date.utc_today()
+    yesterday = Date.add(today, -1)
+    future = Date.add(today, 3)
+
+    dates = Date.range(yesterday, future)
+
+    Enum.each(dates, fn date ->
+      partition_name = "messages_#{date |> Date.to_iso8601() |> String.replace("-", "_")}"
+      start_timestamp = Date.to_string(date)
+      end_timestamp = Date.to_string(Date.add(date, 1))
+
+      Database.transaction(db_conn_pid, fn conn ->
+        create = """
+        CREATE TABLE IF NOT EXISTS realtime.#{partition_name}
+        PARTITION OF realtime.messages
+        FOR VALUES FROM ('#{start_timestamp}') TO ('#{end_timestamp}');
+        """
+
+        alter_owner = "ALTER TABLE realtime.#{partition_name} OWNER TO supabase_realtime_admin"
+
+        with {:ok, _} <- Postgrex.query(conn, create, []),
+             {:ok, _} <- Postgrex.query(conn, alter_owner, []) do
+          Logger.debug("Partition #{partition_name} created")
+        else
+          {:error, %Postgrex.Error{postgres: %{code: :duplicate_table}}} -> :ok
+          {:error, error} -> log_error("PartitionCreationFailed", error)
+        end
+      end)
+    end)
+
+    :ok
   end
 
   defp replication_connected?(external_id) do
@@ -151,6 +190,8 @@ defmodule Realtime.Tenants do
   @spec joins_per_second_rate(String.t(), non_neg_integer) :: RateCounter.Args.t()
   def joins_per_second_rate(tenant_id, max_joins_per_second) when is_binary(tenant_id) do
     opts = [
+      tick: :timer.seconds(5),
+      max_bucket_len: 12,
       telemetry: %{
         event_name: [:channel, :joins],
         measurements: %{limit: max_joins_per_second},
@@ -197,6 +238,8 @@ defmodule Realtime.Tenants do
 
   def events_per_second_rate(tenant_id, max_events_per_second) do
     opts = [
+      tick: :timer.seconds(5),
+      max_bucket_len: 12,
       telemetry: %{
         event_name: [:channel, :events],
         measurements: %{limit: max_events_per_second},
@@ -244,6 +287,8 @@ defmodule Realtime.Tenants do
   @spec db_events_per_second_rate(String.t(), non_neg_integer) :: RateCounter.Args.t()
   def db_events_per_second_rate(tenant_id, max_events_per_second) when is_binary(tenant_id) do
     opts = [
+      tick: :timer.seconds(5),
+      max_bucket_len: 12,
       telemetry: %{
         event_name: [:channel, :db_events],
         measurements: %{},
@@ -290,6 +335,8 @@ defmodule Realtime.Tenants do
   @spec presence_events_per_second_rate(String.t(), non_neg_integer) :: RateCounter.Args.t()
   def presence_events_per_second_rate(tenant_id, max_presence_events_per_second) do
     opts = [
+      tick: :timer.seconds(5),
+      max_bucket_len: 12,
       telemetry: %{
         event_name: [:channel, :presence_events],
         measurements: %{limit: max_presence_events_per_second},
@@ -370,9 +417,9 @@ defmodule Realtime.Tenants do
   def subscription_errors_per_second_key(tenant_id), do: {:channel, :subscription_errors, tenant_id}
 
   @connect_errors_limit 3
-  @connect_errors_tick 200
-  @connect_errors_bucket_len 25
-  @doc "RateCounter arguments for counting connect errors. Uses a 200ms tick with a 25-bucket window (5s) and triggers after 3 errors."
+  @connect_errors_tick 1000
+  @connect_errors_bucket_len 5
+  @doc "RateCounter arguments for counting connect errors. Uses a 1s tick with a 5-bucket window (5s) and triggers after 3 errors."
   @spec connect_errors_per_second_rate(Tenant.t() | String.t()) :: RateCounter.Args.t()
   def connect_errors_per_second_rate(%Tenant{external_id: external_id}) do
     connect_errors_per_second_rate(external_id)
@@ -466,42 +513,6 @@ defmodule Realtime.Tenants do
     do: "#{external_id}:#{sub_topic}"
 
   @doc """
-  Sets tenant as suspended. New connections won't be accepted
-  """
-  @spec suspend_tenant_by_external_id(String.t()) :: {:ok, Tenant.t()} | {:error, term()}
-  def suspend_tenant_by_external_id(external_id) do
-    external_id
-    |> Api.update_tenant_by_external_id(%{suspend: true})
-    |> tap(fn _ -> broadcast_operation_event(:suspend_tenant, external_id) end)
-  end
-
-  @doc """
-  Sets tenant as unsuspended. New connections will be accepted
-  """
-  @spec unsuspend_tenant_by_external_id(String.t()) :: {:ok, Tenant.t()} | {:error, term()}
-  def unsuspend_tenant_by_external_id(external_id) do
-    external_id
-    |> Api.update_tenant_by_external_id(%{suspend: false})
-    |> tap(fn _ -> broadcast_operation_event(:unsuspend_tenant, external_id) end)
-  end
-
-  @doc """
-  Checks if migrations for a given tenant need to run.
-  """
-  @spec run_migrations?(Tenant.t() | integer()) :: boolean()
-  def run_migrations?(%Tenant{} = tenant), do: run_migrations?(tenant.migrations_ran)
-
-  def run_migrations?(migrations_ran) when is_integer(migrations_ran),
-    do: migrations_ran < Enum.count(Migrations.migrations())
-
-  @doc """
-  Broadcasts an operation event to the tenant's operations channel.
-  """
-  @spec broadcast_operation_event(:suspend_tenant | :unsuspend_tenant | :disconnect, String.t()) :: :ok
-  def broadcast_operation_event(action, external_id),
-    do: Phoenix.PubSub.broadcast!(Realtime.PubSub, "realtime:operations:" <> external_id, action)
-
-  @doc """
   Returns the region of the tenant based on its extensions.
   If the region is not set, it returns nil.
   """
@@ -511,7 +522,7 @@ defmodule Realtime.Tenants do
 
   @doc """
   """
-  @spec validate_payload_size(Tenant.t() | binary(), map()) :: :ok | {:error, :payload_size_exceeded}
+  @spec validate_payload_size(Tenant.t() | binary(), map() | binary()) :: :ok | {:error, :payload_size_exceeded}
   def validate_payload_size(tenant_id, payload) when is_binary(tenant_id) do
     tenant_id
     |> Cache.get_tenant_by_external_id()

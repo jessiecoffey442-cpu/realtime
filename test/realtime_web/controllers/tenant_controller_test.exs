@@ -90,7 +90,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
       assert Crypto.encrypt!("127.0.0.1") == settings["db_host"]
       assert Crypto.encrypt!("postgres") == settings["db_name"]
-      assert Crypto.encrypt!("supabase_admin") == settings["db_user"]
+      assert Crypto.encrypt!("supabase_realtime_admin") == settings["db_user"]
       refute settings["db_password"]
       Process.sleep(100)
 
@@ -119,7 +119,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
       assert Crypto.encrypt!("127.0.0.1") == settings["db_host"]
       assert Crypto.encrypt!("postgres") == settings["db_name"]
-      assert Crypto.encrypt!("supabase_admin") == settings["db_user"]
+      assert Crypto.encrypt!("supabase_realtime_admin") == settings["db_user"]
       refute settings["db_password"]
       Process.sleep(100)
       %{extensions: [%{settings: settings}]} = tenant = Tenants.get_tenant_by_external_id(external_id)
@@ -134,7 +134,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "renders tenant when data is valid", %{conn: conn, tenant: tenant} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
       attrs = default_tenant_attrs(port)
       attrs = Map.put(attrs, "external_id", external_id)
       conn = post(conn, ~p"/api/tenants", tenant: attrs)
@@ -150,7 +150,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "can set max_client_presence_events_per_window", %{conn: conn, tenant: tenant} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
       attrs = default_tenant_attrs(port) |> Map.put("max_client_presence_events_per_window", 42)
       attrs = Map.put(attrs, "external_id", external_id)
 
@@ -170,7 +170,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "can set client_presence_window_ms", %{conn: conn, tenant: tenant} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
       attrs = default_tenant_attrs(port) |> Map.put("client_presence_window_ms", 5_000)
       attrs = Map.put(attrs, "external_id", external_id)
 
@@ -205,7 +205,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "renders tenant when data is valid", %{tenant: tenant, conn: conn} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
       attrs = default_tenant_attrs(port)
 
       conn = put(conn, ~p"/api/tenants/#{external_id}", tenant: attrs)
@@ -221,7 +221,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "can update max_client_presence_events_per_window", %{tenant: tenant, conn: conn} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
       attrs = default_tenant_attrs(port) |> Map.put("max_client_presence_events_per_window", 99)
 
       conn = put(conn, ~p"/api/tenants/#{external_id}", tenant: attrs)
@@ -230,7 +230,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "can update client_presence_window_ms", %{tenant: tenant, conn: conn} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
       attrs = default_tenant_attrs(port) |> Map.put("client_presence_window_ms", 10_000)
 
       conn = put(conn, ~p"/api/tenants/#{external_id}", tenant: attrs)
@@ -239,7 +239,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "can update presence_enabled", %{tenant: tenant, conn: conn} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
 
       assert tenant.presence_enabled == false
 
@@ -264,7 +264,7 @@ defmodule RealtimeWeb.TenantControllerTest do
 
     test "sets appropriate observability metadata", %{conn: conn, tenant: tenant} do
       external_id = tenant.external_id
-      port = Database.from_tenant(tenant, "realtime_test", :stop).port
+      port = tenant_db_port(tenant)
       attrs = default_tenant_attrs(port)
 
       # opentelemetry_phoenix expects to be a child of the originating cowboy process hence the Task here :shrug:
@@ -291,6 +291,7 @@ defmodule RealtimeWeb.TenantControllerTest do
       {:ok, _pid} = Connect.lookup_or_start_connection(tenant.external_id)
 
       assert Connect.ready?(tenant.external_id)
+      assert Realtime.Tenants.ReplicationConnection.ready?(tenant.external_id)
 
       assert Cache.get_tenant_by_external_id(tenant.external_id)
       {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
@@ -364,7 +365,11 @@ defmodule RealtimeWeb.TenantControllerTest do
 
       assert status == 204
 
-      assert_receive :disconnect
+      assert_receive %Phoenix.Socket.Broadcast{
+        payload: %{message: "Server requested disconnect", status: "ok", extension: "system"},
+        event: "system"
+      }
+
       assert_receive {:DOWN, _, :process, ^manager_pid, _}
       assert_receive {:DOWN, _, :process, ^connect_pid, _}
 
@@ -568,20 +573,27 @@ defmodule RealtimeWeb.TenantControllerTest do
       assert response(conn, 403) == ""
     end
 
-    test "runs migrations", %{conn: conn} do
+    test "triggers migrations without blocking and self heals eventually", %{conn: conn} do
       tenant = Containers.checkout_tenant(run_migrations: false)
 
       {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
       assert {:error, _} = Postgrex.query(db_conn, "SELECT * FROM realtime.messages", [])
 
       conn = get(conn, ~p"/api/tenants/#{tenant.external_id}/health")
-      data = json_response(conn, 200)["data"]
-      Process.sleep(1000)
+
+      assert %{"healthy" => false, "db_connected" => false, "replication_connected" => false, "connected_cluster" => 0} =
+               json_response(conn, 200)["data"]
+
+      assert eventually(fn ->
+               match?({:ok, %{healthy: true}}, Realtime.Tenants.health_check(tenant.external_id))
+             end)
 
       assert {:ok, %{rows: []}} = Postgrex.query(db_conn, "SELECT * FROM realtime.messages", [])
 
+      conn = get(conn, ~p"/api/tenants/#{tenant.external_id}/health")
+
       assert %{"healthy" => true, "db_connected" => false, "replication_connected" => false, "connected_cluster" => 0} =
-               data
+               json_response(conn, 200)["data"]
     end
 
     test "sets appropriate observability metadata", %{conn: conn, tenant: tenant} do
@@ -656,7 +668,7 @@ defmodule RealtimeWeb.TenantControllerTest do
           "settings" => %{
             "db_host" => "127.0.0.1",
             "db_name" => "postgres",
-            "db_user" => "supabase_admin",
+            "db_user" => "supabase_realtime_admin",
             "db_password" => "postgres",
             "db_port" => "#{port}",
             "poll_interval" => 100,
@@ -687,5 +699,10 @@ defmodule RealtimeWeb.TenantControllerTest do
         Process.sleep(100)
         wait_on_postgres_cdc_rls(external_id, attempt - 1)
     end
+  end
+
+  defp tenant_db_port(tenant) do
+    {:ok, settings} = Database.from_tenant(tenant, "realtime_test", :stop)
+    settings.port
   end
 end

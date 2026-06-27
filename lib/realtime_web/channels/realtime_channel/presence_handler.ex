@@ -55,8 +55,13 @@ defmodule RealtimeWeb.RealtimeChannel.PresenceHandler do
   @spec handle(map(), pid() | nil, Socket.t()) ::
           {:ok, Socket.t()}
           | {:error,
-             :rls_policy_error
+             :invalid_payload
+             | :rls_policy_error
+             | :query_canceled
+             | :missing_partition
+             | :tenant_database_unavailable
              | :unable_to_set_policies
+             | :increase_connection_pool
              | :rate_limit_exceeded
              | :client_rate_limit_exceeded
              | :unable_to_track_presence
@@ -81,14 +86,32 @@ defmodule RealtimeWeb.RealtimeChannel.PresenceHandler do
        when is_private?(socket) and is_nil(socket.assigns.policies.presence.write) do
     %{assigns: %{authorization_context: authorization_context, policies: policies}} = socket
 
-    case Authorization.get_write_authorizations(policies, db_conn, authorization_context) do
-      {:ok, policies} ->
-        socket = assign(socket, :policies, policies)
-        handle_presence_event("track", payload, db_conn, socket)
-
+    # presence is being enabled by this track. Authorize presence.read now if it wasn't evaluated at
+    # join (the join skips it when presence was disabled, leaving read nil) so the channel can gate
+    # presence_diff for this socket, then authorize presence.write.
+    with {:ok, policies} <- maybe_authorize_presence_read(policies, db_conn, authorization_context),
+         {:ok, policies} <-
+           Authorization.get_write_authorizations(policies, db_conn, authorization_context, presence_enabled?: true) do
+      socket = assign(socket, :policies, policies)
+      handle_presence_event("track", payload, db_conn, socket)
+    else
       {:error, :rls_policy_error, error} ->
         log_error("RlsPolicyError", error)
         {:error, :rls_policy_error}
+
+      {:error, :query_canceled, error} ->
+        log_error("QueryCanceled", error)
+        {:error, :query_canceled}
+
+      {:error, :missing_partition} ->
+        log_error("MissingPartition", "Realtime was unable to find the expected messages partition")
+        {:error, :missing_partition}
+
+      {:error, :tenant_database_unavailable} ->
+        {:error, :tenant_database_unavailable}
+
+      {:error, :increase_connection_pool} ->
+        {:error, :increase_connection_pool}
 
       {:error, error} ->
         log_error("UnableToSetPolicies", error)
@@ -146,11 +169,8 @@ defmodule RealtimeWeb.RealtimeChannel.PresenceHandler do
             {:error, :unable_to_track_presence}
         end
 
-      {:error, :rate_limit_exceeded} ->
-        {:error, :rate_limit_exceeded}
-
-      {:error, :payload_size_exceeded} ->
-        {:error, :payload_size_exceeded}
+      {:error, reason} when reason in [:invalid_payload, :rate_limit_exceeded, :payload_size_exceeded] ->
+        {:error, reason}
 
       {:error, error} ->
         log_error("UnableToTrackPresence", error)
@@ -158,13 +178,17 @@ defmodule RealtimeWeb.RealtimeChannel.PresenceHandler do
     end
   end
 
-  defp check_track_payload(assigns, new_payload) do
-    if assigns[:presence_track_payload] != new_payload do
-      :ok
-    else
-      {:error, :no_payload_change}
-    end
+  # presence.read is left unevaluated (nil) at join when presence is disabled. Authorize it now that
+  # presence is being enabled; otherwise it was already evaluated at join, so reuse it.
+  defp maybe_authorize_presence_read(%{presence: %{read: nil}} = policies, db_conn, authorization_context) do
+    Authorization.get_read_authorizations(policies, db_conn, authorization_context, presence_enabled?: true)
   end
+
+  defp maybe_authorize_presence_read(policies, _db_conn, _authorization_context), do: {:ok, policies}
+
+  defp check_track_payload(_assigns, payload) when not is_map(payload), do: {:error, :invalid_payload}
+  defp check_track_payload(%{presence_track_payload: payload}, payload), do: {:error, :no_payload_change}
+  defp check_track_payload(_assigns, _payload), do: :ok
 
   defp presence_dirty_list(topic) do
     [{:pool_size, size}] = :ets.lookup(Presence, :pool_size)

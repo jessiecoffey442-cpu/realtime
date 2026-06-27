@@ -10,6 +10,8 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
 
   alias Realtime.Database
   alias Realtime.Helpers
+  alias Realtime.GenRpc
+  alias Realtime.Telemetry
 
   alias Rls.Subscriptions
 
@@ -17,6 +19,7 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
   @max_delete_records 1000
   @check_oids_interval 60_000
   @check_no_users_interval 60_000
+  @check_active_pids_interval 120_000
   @stop_after 60_000 * 10
 
   defmodule State do
@@ -32,6 +35,7 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
       no_users_ts: nil,
       oids: %{},
       check_oid_ref: nil,
+      check_active_pids_ref: nil,
       check_region_interval: nil
     ]
 
@@ -43,6 +47,7 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
             conn: Postgrex.conn(),
             oids: map(),
             check_oid_ref: reference() | nil,
+            check_active_pids_ref: reference() | nil,
             delete_queue: %{
               ref: reference(),
               queue: :queue.queue()
@@ -79,17 +84,29 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
     extension = Realtime.PostgresCdc.filter_settings("postgres_cdc_rls", tenant.extensions)
     extension = Map.merge(extension, %{"subs_pool_size" => Map.get(extension, "subcriber_pool_size", 4)})
 
-    subscription_manager_settings = Database.from_settings(extension, "realtime_subscription_manager")
-    subscription_manager_pub_settings = Database.from_settings(extension, "realtime_subscription_manager_pub")
+    publication = extension["publication"]
 
-    with {:ok, conn} <- Database.connect_db(subscription_manager_settings),
-         {:ok, conn_pub} <- Database.connect_db(subscription_manager_pub_settings) do
-      Subscriptions.delete_all_if_table_exists(conn)
+    with {:ok, subscription_manager_settings} <- Database.from_settings(extension, "realtime_subscription_manager"),
+         {:ok, subscription_manager_pub_settings} <-
+           Database.from_settings(extension, "realtime_subscription_manager_pub"),
+         {:ok, conn} <- Database.connect_db(subscription_manager_settings),
+         {:ok, conn_pub} <- Database.connect_db(subscription_manager_pub_settings),
+         {:ok, oids} <- Subscriptions.fetch_publication_tables(conn, publication) do
+      # The subscribers ETS tables are owned by the WorkerSupervisor, so they survive a
+      # SubscriptionManager-only restart. An empty pids table means a cold start (fresh
+      # WorkerSupervisor): clear any stale DB rows.
+      # A non-empty table means a warm manager restart: the DB + ETS state is
+      # still valid, so re-adopt it by rebuilding the monitors (the only thing lost with the
+      # previous manager) instead of wiping everyone out.
+      case :ets.info(subscribers_pids_table, :size) do
+        0 ->
+          Subscriptions.delete_all_if_table_exists(conn)
+
+        _ ->
+          readopt_monitors(subscribers_pids_table)
+      end
 
       Rls.update_meta(id, self(), conn_pub)
-
-      publication = extension["publication"]
-      oids = Subscriptions.fetch_publication_tables(conn, publication)
 
       check_region_interval = Map.get(args, :check_region_interval, rebalance_check_interval_in_ms())
       send_region_check_message(check_region_interval)
@@ -107,6 +124,7 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
             queue: :queue.new()
           },
           no_users_ref: check_no_users(),
+          check_active_pids_ref: check_active_pids(),
           check_region_interval: check_region_interval
         }
 
@@ -115,7 +133,7 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
     else
       {:error, reason} ->
         log_error("SubscriptionManagerConnectionFailed", reason)
-        {:stop, reason, nil}
+        {:stop, {:shutdown, reason}, nil}
     end
   end
 
@@ -139,10 +157,10 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
 
     oids =
       case Subscriptions.fetch_publication_tables(conn, publication) do
-        ^old_oids ->
+        {:ok, ^old_oids} ->
           old_oids
 
-        new_oids ->
+        {:ok, new_oids} ->
           Logger.warning("Found new oids #{inspect(new_oids, pretty: true)}")
 
           Subscriptions.delete_all(conn)
@@ -153,7 +171,16 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
           end
           |> :ets.foldl([], state.subscribers_pids_table)
 
+          :ets.delete_all_objects(state.subscribers_pids_table)
+          :ets.delete_all_objects(state.subscribers_nodes_table)
+
           new_oids
+
+        {:error, reason} ->
+          # A fetch error must not be mistaken for a publication change: keep the
+          # current oids and subscribers untouched, just reschedule the next check.
+          log_error("CheckOidsError", reason)
+          old_oids
       end
 
     {:noreply, %{state | oids: oids, check_oid_ref: check_oids()}}
@@ -215,8 +242,16 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
   def handle_info(:check_no_users, %{subscribers_pids_table: tid, no_users_ts: ts} = state) do
     Helpers.cancel_timer(state.no_users_ref)
 
+    subscribers = :ets.info(tid, :size)
+
+    Realtime.Telemetry.execute(
+      [:realtime, :subscriptions, :manager, :subscribers],
+      %{count: subscribers},
+      %{tenant: state.id}
+    )
+
     ts_new =
-      case {:ets.info(tid, :size), ts != nil && ts + @stop_after < now()} do
+      case {subscribers, ts != nil && ts + @stop_after < now()} do
         {0, true} ->
           Logger.info("Stop tenant #{state.id} because of no connected users")
           Rls.handle_stop(state.id, 15_000)
@@ -248,6 +283,34 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
     end
   end
 
+  def handle_info(
+        :check_active_pids,
+        %State{check_active_pids_ref: ref, delete_queue: delete_queue, id: id} = state
+      ) do
+    Helpers.cancel_timer(ref)
+
+    ids =
+      state.subscribers_pids_table
+      |> subscribers_by_node()
+      |> not_alive_pids_dist()
+      |> pop_not_alive_pids(state.subscribers_pids_table, state.subscribers_nodes_table, id)
+
+    new_delete_queue =
+      if length(ids) > 0 do
+        q =
+          Enum.reduce(ids, delete_queue.queue, fn id, acc ->
+            if :queue.member(id, acc), do: acc, else: :queue.in(id, acc)
+          end)
+
+        Helpers.cancel_timer(delete_queue.ref)
+        %{ref: check_delete_queue(1_000), queue: q}
+      else
+        delete_queue
+      end
+
+    {:noreply, %{state | check_active_pids_ref: check_active_pids(), delete_queue: new_delete_queue}}
+  end
+
   def handle_info(msg, state) do
     log_error("UnhandledProcessMessage", msg)
 
@@ -256,7 +319,96 @@ defmodule Extensions.PostgresCdcRls.SubscriptionManager do
 
   ## Internal functions
 
+  # Warm restart: re-adopt the subscribers that survived in ETS.
+  #
+  # The previous manager's monitors died with it, so the new one re-monitors every surviving pid
+  # (refreshing the ref stored in ETS, which the :check_oids path uses to demonitor). A pid that
+  # died during the downtime makes Process.monitor/1 deliver :DOWN immediately, so the existing
+  # :DOWN handler cleans it up — self-healing.
+  #
+  # We deliberately do not reconcile the DB against ETS here: orphan DB rows are hygiene rather
+  # than correctness (the poller falls back to a cluster-wide broadcast on :node_not_found instead
+  # of dropping changes), and any DB-vs-ETS diff would scale with the tenant's total subscription
+  # count on its own database right at restart. Orphans are cleared by the cold-start / OID-change
+  # wipe instead.
+  @spec readopt_monitors(:ets.tid()) :: :ok
+  defp readopt_monitors(subscribers_pids_table) do
+    subscribers_pids_table
+    |> :ets.tab2list()
+    |> Enum.each(fn {pid, id, old_ref, node} ->
+      new_ref = Process.monitor(pid)
+      :ets.delete_object(subscribers_pids_table, {pid, id, old_ref, node})
+      :ets.insert(subscribers_pids_table, {pid, id, new_ref, node})
+    end)
+  end
+
+  @spec pop_not_alive_pids([pid()], :ets.tid(), :ets.tid(), binary()) :: [Ecto.UUID.t()]
+  def pop_not_alive_pids(pids, subscribers_pids_table, subscribers_nodes_table, tenant_id) do
+    Enum.reduce(pids, [], fn pid, acc ->
+      case :ets.lookup(subscribers_pids_table, pid) do
+        [] ->
+          Telemetry.execute(
+            [:realtime, :subscriptions, :manager, :dead_pid],
+            %{quantity: 1},
+            %{tenant: tenant_id, reason: :not_found}
+          )
+
+          acc
+
+        results ->
+          for {^pid, postgres_id, _ref, _node} <- results do
+            Telemetry.execute(
+              [:realtime, :subscriptions, :manager, :dead_pid],
+              %{quantity: 1},
+              %{tenant: tenant_id, reason: :phantom}
+            )
+
+            :ets.delete(subscribers_pids_table, pid)
+            bin_id = UUID.string_to_binary!(postgres_id)
+
+            :ets.delete(subscribers_nodes_table, bin_id)
+            bin_id
+          end ++ acc
+      end
+    end)
+  end
+
+  @spec subscribers_by_node(:ets.tid()) :: %{node() => MapSet.t(pid())}
+  def subscribers_by_node(tid) do
+    fn {pid, _postgres_id, _ref, node}, acc ->
+      set = if Map.has_key?(acc, node), do: MapSet.put(acc[node], pid), else: MapSet.new([pid])
+
+      Map.put(acc, node, set)
+    end
+    |> :ets.foldl(%{}, tid)
+  end
+
+  @spec not_alive_pids_dist(%{node() => MapSet.t(pid())}) :: [pid()] | []
+  def not_alive_pids_dist(pids) do
+    Enum.reduce(pids, [], fn {node, pids}, acc ->
+      if node == node() do
+        acc ++ not_alive_pids(pids)
+      else
+        case GenRpc.call(node, __MODULE__, :not_alive_pids, [pids], timeout: 15_000) do
+          {:error, :rpc_error, _} = error ->
+            log_error("UnableToCheckProcessesOnRemoteNode", error)
+            acc
+
+          pids ->
+            acc ++ pids
+        end
+      end
+    end)
+  end
+
+  @spec not_alive_pids(MapSet.t(pid())) :: [pid()] | []
+  def not_alive_pids(pids) do
+    Enum.reduce(pids, [], fn pid, acc -> if Process.alive?(pid), do: acc, else: [pid | acc] end)
+  end
+
   defp check_oids, do: Process.send_after(self(), :check_oids, @check_oids_interval)
+
+  defp check_active_pids, do: Process.send_after(self(), :check_active_pids, @check_active_pids_interval)
 
   defp now, do: System.system_time(:millisecond)
 

@@ -44,7 +44,7 @@ defmodule Realtime.Database do
   @doc """
   Creates a database connection struct from the given tenant.
   """
-  @spec from_tenant(Tenant.t(), binary(), :stop | :exp | :rand | :rand_exp) :: t()
+  @spec from_tenant(Tenant.t(), binary(), :stop | :exp | :rand | :rand_exp) :: {:ok, t()} | {:error, :nxdomain}
   def from_tenant(%Tenant{} = tenant, application_name, backoff \\ :rand_exp) do
     tenant
     |> then(&Realtime.PostgresCdc.filter_settings(@cdc, &1.extensions))
@@ -54,33 +54,57 @@ defmodule Realtime.Database do
   @doc """
   Creates a database connection struct from the given settings.
   """
-  @spec from_settings(map(), binary(), :stop | :exp | :rand | :rand_exp) :: t()
+  @spec from_settings(map(), binary(), :stop | :exp | :rand | :rand_exp) :: {:ok, t()} | {:error, :nxdomain}
   def from_settings(settings, application_name, backoff \\ :rand_exp) do
     pool = pool_size_by_application_name(application_name, settings)
 
     settings =
       settings
-      |> Map.take(["db_host", "db_port", "db_name", "db_user", "db_password"])
+      |> Map.take([
+        "db_host",
+        "db_port",
+        "db_name",
+        "db_user",
+        "db_password",
+        "db_user_realtime",
+        "db_pass_realtime"
+      ])
       |> Enum.map(fn {k, v} -> {k, Crypto.decrypt!(v)} end)
       |> Map.new()
       |> then(&Map.merge(settings, &1))
 
-    {:ok, addrtype} = detect_ip_version(settings["db_host"])
-    ssl = if default_ssl_param(settings), do: [verify: :verify_none], else: false
+    {username, password} = connection_credentials(application_name, settings)
 
-    %__MODULE__{
-      hostname: settings["db_host"],
-      port: String.to_integer(settings["db_port"]),
-      database: settings["db_name"],
-      username: settings["db_user"],
-      password: settings["db_password"],
-      pool_size: pool,
-      queue_target: settings["db_queue_target"] || 5_000,
-      application_name: application_name,
-      backoff_type: backoff,
-      socket_options: [addrtype],
-      ssl: ssl
-    }
+    with {:ok, addrtype} <- detect_ip_version(settings["db_host"]) do
+      ssl = if default_ssl_param(settings), do: [verify: :verify_none], else: false
+
+      {:ok,
+       %__MODULE__{
+         hostname: settings["db_host"],
+         port: String.to_integer(settings["db_port"]),
+         database: settings["db_name"],
+         username: username,
+         password: password,
+         pool_size: pool,
+         queue_target: settings["db_queue_target"] || 5_000,
+         application_name: application_name,
+         backoff_type: backoff,
+         socket_options: [addrtype],
+         ssl: ssl
+       }}
+    end
+  end
+
+  defp connection_credentials("realtime_migrations" = _application_name, settings) do
+    {settings["db_user"], settings["db_password"]}
+  end
+
+  # Runtime connections prefer the least-privilege role, falling back to db_user.
+  defp connection_credentials(_application_name, settings) do
+    case settings["db_user_realtime"] do
+      nil -> {settings["db_user"], settings["db_password"]}
+      user -> {user, settings["db_pass_realtime"]}
+    end
   end
 
   @available_connection_factor 0.95
@@ -88,7 +112,6 @@ defmodule Realtime.Database do
   @doc """
   Checks if the Tenant CDC extension information is properly configured and that we're able to query against the tenant database.
   """
-
   @spec check_tenant_connection(Tenant.t() | nil) :: {:error, atom()} | {:ok, pid(), non_neg_integer()}
   def check_tenant_connection(nil), do: {:error, :tenant_not_found}
 
@@ -97,10 +120,10 @@ defmodule Realtime.Database do
     |> then(&PostgresCdc.filter_settings(@cdc, &1.extensions))
     |> then(fn settings ->
       required_pool = tenant_pool_requirements(settings)
-      check_settings = from_settings(settings, "realtime_connect", :stop)
-      check_settings = Map.put(check_settings, :max_restarts, 0)
 
-      with {:ok, conn} <- connect_db(check_settings),
+      with {:ok, base_settings} <- from_settings(settings, "realtime_connect", :stop),
+           check_settings = %{base_settings | max_restarts: 0},
+           {:ok, conn} <- connect_db(check_settings),
            {:ok, [available_connections, migrations_ran]} <- query_connection_info(conn) do
         requirement = ceil(required_pool * @available_connection_factor)
 
@@ -135,19 +158,43 @@ defmodule Realtime.Database do
   """
 
   defp query_connection_info(conn) do
-    Postgrex.transaction(conn, fn conn ->
-      %{rows: [[available_connections]]} = Postgrex.query!(conn, @connections_query, [])
-      %{rows: [[table_exists]]} = Postgrex.query!(conn, @migrations_table_exists_query, [])
+    %{rows: [[available_connections]]} = Postgrex.query!(conn, @connections_query, [])
+    %{rows: [[table_exists]]} = Postgrex.query!(conn, @migrations_table_exists_query, [])
 
-      %{rows: [[migrations_ran]]} =
-        if table_exists, do: Postgrex.query!(conn, @migrations_count_query, []), else: %{rows: [[0]]}
+    %{rows: [[migrations_ran]]} =
+      if table_exists, do: Postgrex.query!(conn, @migrations_count_query, []), else: %{rows: [[0]]}
 
-      [available_connections, migrations_ran]
-    end)
+    {:ok, [available_connections, migrations_ran]}
   rescue
     e ->
       GenServer.stop(conn)
       {:error, e}
+  end
+
+  @slot_lag_query """
+  SELECT
+    COALESCE(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn), 0) >
+      (pg_size_bytes(current_setting('max_slot_wal_keep_size')) / 2)
+  FROM pg_replication_slots
+  WHERE slot_name = $1
+    AND current_setting('max_slot_wal_keep_size') != '-1'
+  """
+
+  @doc """
+  Checks if a replication slot's WAL lag exceeds 50% of max_slot_wal_keep_size.
+
+  Returns :ok when the slot is within safe bounds, max_slot_wal_keep_size is disabled (-1),
+  or the slot does not exist. Returns {:error, :lag_too_high} only when the slot is confirmed
+  to be consuming more than 50% of the per-slot WAL limit.
+  """
+  @spec check_replication_slot_lag(pid(), String.t()) ::
+          :ok | {:error, :lag_too_high} | {:error, any()}
+  def check_replication_slot_lag(conn, slot_name) do
+    case Postgrex.query(conn, @slot_lag_query, [slot_name]) do
+      {:ok, %{rows: [[true]]}} -> {:error, :lag_too_high}
+      {:ok, %{rows: _}} -> :ok
+      {:error, _} = err -> err
+    end
   end
 
   @doc """
@@ -156,9 +203,9 @@ defmodule Realtime.Database do
   @spec connect(Tenant.t(), binary(), :stop | :exp | :rand | :rand_exp) ::
           {:ok, pid()} | {:error, any()}
   def connect(tenant, application_name, backoff \\ :stop) do
-    tenant
-    |> from_tenant(application_name, backoff)
-    |> connect_db()
+    with {:ok, settings} <- from_tenant(tenant, application_name, backoff) do
+      connect_db(settings)
+    end
   end
 
   @doc """
@@ -270,7 +317,6 @@ defmodule Realtime.Database do
     case application_name do
       "realtime_subscription_manager" -> 1
       "realtime_subscription_manager_pub" -> settings["subs_pool_size"] || 1
-      "realtime_subscription_checker" -> 1
       "realtime_connect" -> settings["db_pool"] || 1
       "realtime_health_check" -> 1
       "realtime_janitor" -> 1
@@ -304,15 +350,8 @@ defmodule Realtime.Database do
       {:ok, :inet6}
     else
       case :inet.gethostbyname(host) do
-        {:ok, hostent} ->
-          [addr | _] = elem(hostent, 5)
-          resolved = addr |> :inet.ntoa() |> to_string()
-          log_warning("IpV4Detected", "IPv4 detected for host #{inspect(host)} resolved to #{resolved}")
-
-          {:ok, :inet}
-
-        _ ->
-          {:error, :nxdomain}
+        {:ok, _} -> {:ok, :inet}
+        _ -> {:error, :nxdomain}
       end
     end
   end
@@ -391,7 +430,6 @@ defmodule Realtime.Database do
     application_names = [
       "realtime_subscription_manager",
       "realtime_subscription_manager_pub",
-      "realtime_subscription_checker",
       "realtime_health_check",
       "realtime_janitor",
       "realtime_migrations",

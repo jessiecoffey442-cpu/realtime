@@ -1,46 +1,5 @@
 defmodule RealtimeWeb.UserSocket do
-  # This is defined up here before `use Phoenix.Socket` is called so that we can define `Phoenix.Socket.init/1`
-  # It has to be overridden because we need to set the `max_heap_size` flag from the transport process context
-  @impl Phoenix.Socket.Transport
-  def handle_in({payload, opts}, {_state, socket} = full_state) do
-    Phoenix.Socket.__in__({payload, opts}, full_state)
-  rescue
-    e in Phoenix.Socket.InvalidMessageError ->
-      RealtimeWeb.RealtimeChannel.Logging.log_error(socket, "MalformedWebSocketMessage", e.message)
-      {:ok, full_state}
-
-    e in Jason.DecodeError ->
-      RealtimeWeb.RealtimeChannel.Logging.log_error(socket, "MalformedWebSocketMessage", Jason.DecodeError.message(e))
-      {:ok, full_state}
-
-    e ->
-      RealtimeWeb.RealtimeChannel.Logging.log_error(socket, "UnknownErrorOnWebSocketMessage", Exception.message(e))
-      {:ok, full_state}
-  end
-
-  @impl true
-  def init(state) when is_tuple(state) do
-    Process.flag(:max_heap_size, max_heap_size())
-    Process.send_after(self(), {:measure_traffic, 0, 0}, measure_traffic_interval_in_ms())
-    Phoenix.Socket.__init__(state)
-  end
-
-  @impl true
-  def handle_info(
-        {:measure_traffic, previous_recv, previous_send},
-        {_, %{assigns: assigns, transport_pid: transport_pid}} = state
-      ) do
-    tenant_external_id = Map.get(assigns, :tenant)
-
-    %{latest_recv: latest_recv, latest_send: latest_send} =
-      collect_traffic_telemetry(transport_pid, tenant_external_id, previous_recv, previous_send)
-
-    Process.send_after(self(), {:measure_traffic, latest_recv, latest_send}, measure_traffic_interval_in_ms())
-
-    {:ok, state}
-  end
-
-  use Phoenix.Socket
+  use RealtimeWeb.Socket
   use Realtime.Logs
 
   alias Realtime.Api.Tenant
@@ -52,6 +11,8 @@ defmodule RealtimeWeb.UserSocket do
   alias RealtimeWeb.ChannelsAuthorization
   alias RealtimeWeb.RealtimeChannel
   alias RealtimeWeb.RealtimeChannel.Logging
+  alias RealtimeWeb.RealtimeChannel.MessageDispatcher
+
   ## Channels
   channel "realtime:*", RealtimeChannel
 
@@ -62,6 +23,29 @@ defmodule RealtimeWeb.UserSocket do
 
   @spec subscribers_id(String.t()) :: String.t()
   def subscribers_id(tenant), do: "user_socket:" <> tenant
+
+  @spec disconnect(binary()) :: :ok
+  def disconnect(tenant_external_id) do
+    Logger.warning("Disconnecting all sockets for tenant #{tenant_external_id}",
+      external_id: tenant_external_id,
+      project: tenant_external_id
+    )
+
+    disconnect_msg = %Phoenix.Socket.Broadcast{
+      event: "system",
+      payload: %{extension: "system", status: "ok", message: "Server requested disconnect"}
+    }
+
+    Phoenix.PubSub.broadcast!(
+      Realtime.PubSub,
+      "realtime:operations:" <> tenant_external_id,
+      disconnect_msg,
+      MessageDispatcher
+    )
+
+    Phoenix.PubSub.broadcast(Realtime.PubSub, subscribers_id(tenant_external_id), :socket_drain)
+    :ok
+  end
 
   @impl true
   def connect(params, socket, opts) do
@@ -80,12 +64,13 @@ defmodule RealtimeWeb.UserSocket do
       |> assign(:log_level, log_level)
       |> assign(:access_token, token)
 
-    with %Tenant{
-           jwt_secret: jwt_secret,
-           jwt_jwks: jwt_jwks,
-           suspend: false
-         } = tenant <- Tenants.Cache.get_tenant_by_external_id(external_id),
-         token when is_binary(token) <- token,
+    with {:ok,
+          %Tenant{
+            jwt_secret: jwt_secret,
+            jwt_jwks: jwt_jwks,
+            suspend: false
+          } = tenant} <- Tenants.Cache.fetch_tenant_by_external_id(external_id),
+         {:ok, token} <- validate_token(token),
          jwt_secret_dec <- Crypto.decrypt!(jwt_secret),
          {:ok, claims} <- ChannelsAuthorization.authorize_conn(token, jwt_secret_dec, jwt_jwks),
          :ok <- TenantRateLimiters.check_tenant(tenant) do
@@ -103,40 +88,44 @@ defmodule RealtimeWeb.UserSocket do
 
       {:ok, assign(socket, assigns)}
     else
-      nil ->
+      {:error, :tenant_not_found} ->
         log_error("TenantNotFound", "Tenant not found: #{external_id}")
-        {:error, :tenant_not_found}
+        connect_error(:tenant_not_found)
 
-      %Tenant{suspend: true} ->
+      {:ok, %Tenant{suspend: true}} ->
         Logging.log_error(socket, "RealtimeDisabledForTenant", "Realtime disabled for this tenant")
-        {:error, :tenant_suspended}
+        connect_error(:tenant_suspended)
+
+      {:error, :missing_api_key} ->
+        log_error("MissingAPIKey", "API key is missing or not a valid string")
+        connect_error(:missing_api_key)
 
       {:error, :expired_token, msg} ->
         Logging.maybe_log_warning(socket, "InvalidJWTToken", msg)
-        {:error, :expired_token}
+        connect_error(:expired_token)
 
       {:error, :missing_claims} ->
         msg = "Fields `role` and `exp` are required in JWT"
         Logging.maybe_log_warning(socket, "InvalidJWTToken", msg)
-        {:error, :missing_claims}
+        connect_error(:missing_claims)
 
       {:error, :token_malformed} ->
         log_error("MalformedJWT", "The token provided is not a valid JWT")
-        {:error, :token_malformed}
+        connect_error(:token_malformed)
 
       {:error, :too_many_connections} ->
         msg = "Too many connected users"
         Logging.log_error(socket, "ConnectionRateLimitReached", msg)
-        {:error, :too_many_connections}
+        connect_error(:too_many_connections)
 
       {:error, :too_many_joins} ->
         msg = "Too many joins per second"
         Logging.log_error(socket, "JoinsRateLimitReached", msg)
-        {:error, :too_many_joins}
+        connect_error(:too_many_joins)
 
       error ->
         log_error("ErrorConnectingToWebsocket", error)
-        {:error, error}
+        connect_error(error)
     end
   end
 
@@ -154,40 +143,13 @@ defmodule RealtimeWeb.UserSocket do
     end
   end
 
-  defp max_heap_size(), do: :persistent_term.get({__MODULE__, :websocket_max_heap_size})
-  defp measure_traffic_interval_in_ms(), do: :persistent_term.get({__MODULE__, :measure_traffic_interval_in_ms})
+  defp validate_token(token) when is_binary(token), do: {:ok, token}
+  defp validate_token(_), do: {:error, :missing_api_key}
 
-  defp collect_traffic_telemetry(nil, _tenant_external_id, previous_recv, previous_send),
-    do: %{latest_recv: previous_recv, latest_send: previous_send}
-
-  defp collect_traffic_telemetry(transport_pid, tenant_external_id, previous_recv, previous_send) do
-    %{send_oct: latest_send, recv_oct: latest_recv} =
-      transport_pid
-      |> Process.info(:links)
-      |> then(fn {:links, links} -> links end)
-      |> Enum.filter(&is_port/1)
-      |> Enum.reduce(%{send_oct: 0, recv_oct: 0}, fn link, acc ->
-        case :inet.getstat(link, [:send_oct, :recv_oct]) do
-          {:ok, stats} ->
-            send_oct = Keyword.get(stats, :send_oct, 0)
-            recv_oct = Keyword.get(stats, :recv_oct, 0)
-
-            %{
-              send_oct: acc.send_oct + send_oct,
-              recv_oct: acc.recv_oct + recv_oct
-            }
-
-          {:error, _} ->
-            acc
-        end
-      end)
-
-    send_delta = max(0, latest_send - previous_send)
-    recv_delta = max(0, latest_recv - previous_recv)
-
-    :telemetry.execute([:realtime, :channel, :output_bytes], %{size: send_delta}, %{tenant: tenant_external_id})
-    :telemetry.execute([:realtime, :channel, :input_bytes], %{size: recv_delta}, %{tenant: tenant_external_id})
-
-    %{latest_recv: latest_recv, latest_send: latest_send}
+  defp connect_error(reason) do
+    Process.sleep(connect_error_backoff_ms())
+    {:error, reason}
   end
+
+  defp connect_error_backoff_ms(), do: :persistent_term.get({__MODULE__, :connect_error_backoff_ms})
 end

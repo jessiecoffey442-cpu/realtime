@@ -2,7 +2,6 @@ defmodule RealtimeWeb.Router do
   use RealtimeWeb, :router
 
   require Logger
-  require OpenTelemetry.Tracer, as: Tracer
 
   import RealtimeWeb.ChannelsAuthorization, only: [authorize: 3]
 
@@ -37,13 +36,20 @@ defmodule RealtimeWeb.Router do
     plug(:set_span_request_id)
   end
 
+  pipeline :broadcast_single do
+    plug(:accepts, ["json", "octet-stream"])
+    plug(RealtimeWeb.Plugs.ValidateBroadcastContentType)
+    plug(RealtimeWeb.Plugs.AssignTenant)
+    plug(RealtimeWeb.Plugs.RateLimiter)
+    plug(:set_span_request_id)
+  end
+
   pipeline :dashboard_admin do
     plug(:dashboard_auth)
   end
 
   pipeline :metrics do
     plug(:check_auth, [:metrics_jwt_secret, :metrics_blocklist])
-    plug(RealtimeWeb.Plugs.MetricsMode)
   end
 
   pipeline :openapi do
@@ -71,6 +77,7 @@ defmodule RealtimeWeb.Router do
   scope "/admin", RealtimeWeb do
     pipe_through [:browser, :dashboard_admin]
     live("/tenants", TenantsLive.Index, :index)
+    live("/feature-flags", FeatureFlagsLive.Index, :index)
   end
 
   scope "/metrics", RealtimeWeb do
@@ -78,13 +85,6 @@ defmodule RealtimeWeb.Router do
 
     get("/", MetricsController, :index)
     get("/:region", MetricsController, :region)
-  end
-
-  scope "/tenant-metrics", RealtimeWeb do
-    pipe_through(:metrics)
-
-    get("/", MetricsController, :tenant)
-    get("/:region", MetricsController, :region_tenant)
   end
 
   scope "/api" do
@@ -114,6 +114,12 @@ defmodule RealtimeWeb.Router do
     post("/broadcast", BroadcastController, :broadcast)
   end
 
+  scope "/api", RealtimeWeb do
+    pipe_through([:open_cors, :broadcast_single, :secure_tenant_api])
+
+    post("/broadcast/:topic/events/:event", BroadcastSingleController, :broadcast)
+  end
+
   # Enables LiveDashboard only for development
   #
   # If you want to use the LiveDashboard in production, you should put
@@ -136,19 +142,24 @@ defmodule RealtimeWeb.Router do
       metrics: RealtimeWeb.Telemetry,
       additional_pages: [
         route_name: RealtimeWeb.Dashboard.ProcessDump,
-        tenant_info: RealtimeWeb.Dashboard.TenantInfo
+        recon_trace: RealtimeWeb.Dashboard.ReconTrace,
+        node_info: RealtimeWeb.Dashboard.NodeInfo,
+        tenant_info: RealtimeWeb.Dashboard.TenantInfo,
+        tenant_migrations: RealtimeWeb.Dashboard.TenantMigrations,
+        sql_inspector: RealtimeWeb.Dashboard.SqlInspector,
+        feature_flags: RealtimeWeb.Dashboard.FeatureFlags
       ]
     )
   end
 
   defp check_auth(conn, [secret_key, blocklist_key]) do
-    secret = Application.fetch_env!(:realtime, secret_key)
+    secrets = :realtime |> Application.fetch_env!(secret_key) |> List.wrap()
     blocklist = Application.get_env(:realtime, blocklist_key, [])
 
     with ["Bearer " <> token] <- get_req_header(conn, "authorization"),
          token <- Regex.replace(~r/\s|\n/, URI.decode(token), ""),
          false <- token in blocklist,
-         {:ok, _claims} <- authorize(token, secret, nil) do
+         {:ok, _claims} <- authorize_any(token, secrets) do
       conn
     else
       _ ->
@@ -156,6 +167,15 @@ defmodule RealtimeWeb.Router do
         |> send_resp(403, "")
         |> halt()
     end
+  end
+
+  defp authorize_any(token, secrets) do
+    Enum.find_value(secrets, {:error, :unauthorized}, fn secret ->
+      case authorize(token, secret, nil) do
+        {:ok, claims} -> {:ok, claims}
+        _ -> nil
+      end
+    end)
   end
 
   defp dashboard_auth(conn, _opts) do
@@ -178,7 +198,7 @@ defmodule RealtimeWeb.Router do
     # Must have been set by BaggageRequestId
     # We can't set the span attribute there because the phoenix span only starts after it reaches the Router
     if request_id = Logger.metadata()[:request_id] do
-      Tracer.set_attribute(:request_id, request_id)
+      OpenTelemetry.Tracer.set_attribute(:request_id, request_id)
     end
 
     conn

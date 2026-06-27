@@ -3,20 +3,22 @@ defmodule Containers do
   alias Realtime.Tenants.Connect
   alias Containers.Container
   alias Realtime.Database
+  alias Realtime.Tenants
   alias Realtime.Tenants.Migrations
 
   use GenServer
 
-  @image "supabase/postgres:17.6.1.074"
+  defp image, do: System.get_env("POSTGRES_IMAGE", "supabase/postgres:17.6.1.127")
+
   # Pull image if not available
   def pull do
-    case System.cmd("docker", ["image", "inspect", @image]) do
+    case System.cmd("docker", ["image", "inspect", image()]) do
       {_, 0} ->
         :ok
 
       _ ->
-        IO.puts("Pulling image #{@image}. This might take a while...")
-        {_, 0} = System.cmd("docker", ["pull", @image])
+        IO.puts("Pulling image #{image()}. This might take a while...")
+        {_, 0} = System.cmd("docker", ["pull", image()])
     end
   end
 
@@ -28,7 +30,14 @@ defmodule Containers do
   def init(max_cases) do
     existing_containers = existing_containers("realtime-test-*")
     ports = for {_, port} <- existing_containers, do: port
-    available_ports = Enum.shuffle(5501..9000) -- ports
+
+    partition = System.get_env("MIX_TEST_PARTITION", "1") |> String.to_integer()
+    total_partitions = System.get_env("MIX_TEST_TOTAL_PARTITIONS", "4") |> String.to_integer()
+    all_ports = 5501..9000
+    range_size = div(Enum.count(all_ports), total_partitions)
+
+    available_ports =
+      all_ports |> Enum.slice((partition - 1) * range_size, range_size) |> Enum.shuffle() |> Kernel.--(ports)
 
     {:ok, %{existing_containers: existing_containers, ports: available_ports}, {:continue, {:pool, max_cases}}}
   end
@@ -60,12 +69,22 @@ defmodule Containers do
         {:reply, {:ok, name, port}, %{state | existing_containers: rest}}
 
       [] ->
-        [port | ports] = state.ports
-        name = "realtime-test-#{random_string(12)}"
-
-        docker_run!(name, port)
-
+        {name, port, ports} = start_available_container(state.ports)
         {:reply, {:ok, name, port}, %{state | ports: ports}}
+    end
+  end
+
+  defp start_available_container(ports, attempts \\ 5)
+
+  defp start_available_container([], _attempts), do: raise("Containers: no ports left to start a container")
+  defp start_available_container(_ports, 0), do: raise("Containers: exhausted retries starting a container")
+
+  defp start_available_container([port | ports], attempts) do
+    name = "realtime-test-#{random_string(12)}"
+
+    case docker_run(name, port) do
+      {_, 0} -> {name, port, ports}
+      {_output, _code} -> start_available_container(ports, attempts - 1)
     end
   end
 
@@ -96,7 +115,7 @@ defmodule Containers do
 
     Migrations.run_migrations(tenant)
     {:ok, pid} = Database.connect(tenant, "realtime_test", :stop)
-    :ok = Migrations.create_partitions(pid)
+    :ok = Tenants.create_messages_partitions(pid)
     Process.exit(pid, :normal)
 
     tenant
@@ -116,8 +135,10 @@ defmodule Containers do
   end
 
   defp storage_up!(tenant) do
+    {:ok, db_settings} = Database.from_tenant(tenant, "realtime_test", :stop)
+
     settings =
-      Database.from_tenant(tenant, "realtime_test", :stop)
+      db_settings
       |> Map.from_struct()
       |> Keyword.new()
 
@@ -136,18 +157,20 @@ defmodule Containers do
          port <- Container.port(container) do
       tenant = repo_run(mode, fn -> Generators.tenant_fixture(%{port: port, migrations_ran: 0}) end)
 
+      # TODO: REAL-818 - remove when Project Migrations v2 is done
+      Realtime.FeatureFlags.Cache.update_cache(%Realtime.Api.FeatureFlag{
+        name: "use_supabase_realtime_admin",
+        enabled: true
+      })
+
       run_migrations? = Keyword.get(opts, :run_migrations, false)
 
-      settings = Database.from_tenant(tenant, "realtime_test", :stop)
+      {:ok, settings} = Database.from_tenant(tenant, "realtime_test", :stop)
       settings = %{settings | max_restarts: 0, ssl: false}
       {:ok, conn} = Database.connect_db(settings)
 
       try do
-        Postgrex.transaction(conn, fn db_conn ->
-          Postgrex.query!(db_conn, "DROP SCHEMA IF EXISTS realtime CASCADE", [])
-          Postgrex.query!(db_conn, "CREATE SCHEMA IF NOT EXISTS realtime", [])
-        end)
-
+        reset_realtime_schema!(settings)
         storage_up!(tenant)
 
         RateCounterHelper.stop(tenant.external_id)
@@ -175,7 +198,7 @@ defmodule Containers do
         if run_migrations? do
           case run_migrations(tenant) do
             {:ok, count} ->
-              :ok = Migrations.create_partitions(conn)
+              :ok = Tenants.create_messages_partitions(conn)
 
               {:ok, tenant} =
                 repo_run(mode, fn ->
@@ -203,11 +226,27 @@ defmodule Containers do
   defp repo_run(:unboxed, fun), do: Ecto.Adapters.SQL.Sandbox.unboxed_run(Realtime.Repo, fun)
   defp repo_run(:sandbox, fun), do: fun.()
 
+  defp reset_realtime_schema!(settings) do
+    {:ok, admin_conn} =
+      Postgrex.start_link(
+        hostname: settings.hostname,
+        port: settings.port,
+        database: settings.database,
+        username: "supabase_admin",
+        password: settings.password
+      )
+
+    Postgrex.query!(admin_conn, "DROP PUBLICATION IF EXISTS supabase_realtime_test", [])
+    Postgrex.query!(admin_conn, "DROP SCHEMA IF EXISTS realtime CASCADE", [])
+    Postgrex.query!(admin_conn, "CREATE SCHEMA realtime", [])
+    Postgrex.query!(admin_conn, "GRANT USAGE ON SCHEMA realtime TO postgres, anon, authenticated, service_role", [])
+    Postgrex.query!(admin_conn, "GRANT ALL ON SCHEMA realtime TO supabase_realtime_admin WITH GRANT OPTION", [])
+  end
+
   def stop_containers() do
     {list, 0} = System.cmd("docker", ["ps", "-a", "--format", "{{.Names}}", "--filter", "name=realtime-test-*"])
-    names = list |> String.trim() |> String.split("\n")
 
-    for name <- names do
+    for name <- String.split(list, "\n", trim: true) do
       System.cmd("docker", ["rm", "-f", name])
     end
   end
@@ -253,7 +292,7 @@ defmodule Containers do
   # This exists so we avoid using an external process on Realtime.Tenants.Migrations
   defp run_migrations(tenant) do
     %{extensions: [%{settings: settings} | _]} = tenant
-    settings = Database.from_settings(settings, "realtime_migrations", :stop)
+    {:ok, settings} = Database.from_settings(settings, "realtime_migrations", :stop)
 
     [
       hostname: settings.hostname,
@@ -282,8 +321,16 @@ defmodule Containers do
   end
 
   defp docker_run!(name, port) do
-    {_, 0} =
-      System.cmd("docker", [
+    {_, 0} = docker_run(name, port)
+  end
+
+  defp docker_run(name, port) do
+    initdb_sh = Path.expand("../../dev/postgres/za-permit-supabase-admin.sh", __DIR__)
+    initdb_sql = Path.expand("../../dev/postgres/zb-supabase-schema.sql", __DIR__)
+
+    System.cmd(
+      "docker",
+      [
         "run",
         "-d",
         "--rm",
@@ -293,9 +340,13 @@ defmodule Containers do
         "POSTGRES_HOST=/var/run/postgresql",
         "-e",
         "POSTGRES_PASSWORD=postgres",
+        "-v",
+        "#{initdb_sh}:/docker-entrypoint-initdb.d/za-permit-supabase-admin.sh",
+        "-v",
+        "#{initdb_sql}:/docker-entrypoint-initdb.d/zb-supabase-schema.sql",
         "-p",
         "#{port}:5432",
-        @image,
+        image(),
         "postgres",
         "-c",
         "config_file=/etc/postgresql/postgresql.conf",
@@ -305,6 +356,8 @@ defmodule Containers do
         "max_wal_size=32MB",
         "-c",
         "max_slot_wal_keep_size=32MB"
-      ])
+      ],
+      stderr_to_stdout: true
+    )
   end
 end

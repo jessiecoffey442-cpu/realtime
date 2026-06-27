@@ -15,7 +15,7 @@ for repo <- [
       Realtime.Repo.Replica.SanJose
     ] do
   config :realtime, repo,
-    username: "supabase_admin",
+    username: "supabase_realtime_admin",
     password: "postgres",
     database: "realtime_test#{partition}",
     hostname: "127.0.0.1",
@@ -32,7 +32,6 @@ config :realtime, RealtimeWeb.Endpoint,
 System.put_env("REGION", "us-east-1")
 
 config :realtime,
-  regional_broadcasting: true,
   region: "us-east-1",
   db_enc_key: "1234567890123456",
   jwt_claim_validators: System.get_env("JWT_CLAIM_VALIDATORS", "{}"),
@@ -41,7 +40,10 @@ config :realtime,
   prom_poll_rate: 5_000,
   request_id_baggage_key: "sb-request-id",
   node_balance_uptime_threshold_in_ms: 999_999_999_999,
+  connect_error_backoff_ms: 100,
+  channel_error_backoff_ms: 100,
   max_gen_rpc_clients: 5,
+  max_gen_rpc_call_clients: 1,
   metrics_pusher_req_options: [
     plug: {Req.Test, Realtime.MetricsPusher}
   ]

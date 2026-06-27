@@ -6,6 +6,8 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
 
   alias Realtime.Api.Message
   alias Realtime.Database
+  alias Realtime.GenCounter
+  alias Realtime.RateCounter
   alias Realtime.Tenants
   alias Realtime.Tenants.ReplicationConnection
   alias RealtimeWeb.Endpoint
@@ -84,7 +86,7 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
               "settings" => %{
                 "db_host" => "127.0.0.1",
                 "db_name" => "postgres",
-                "db_user" => "supabase_admin",
+                "db_user" => "supabase_realtime_admin",
                 "db_password" => "postgres",
                 "db_port" => "9001",
                 "poll_interval" => 100,
@@ -416,13 +418,13 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
             "payload" => %{"value" => "something"}
           })
 
-          refute_receive %Phoenix.Socket.Broadcast{}, 500
+          refute_receive _any, 500
         end)
 
       assert logs =~ "UnableToBroadcastChanges"
     end
 
-    test "message that exceeds payload size logs error", %{tenant: tenant} do
+    test "message that exceeds payload size is not broadcast and logs error", %{tenant: tenant} do
       logs =
         capture_log(fn ->
           start_supervised!(
@@ -436,15 +438,49 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
 
           message_fixture(tenant, %{
             "event" => random_string(),
-            "topic" => random_string(),
+            "topic" => topic,
             "private" => true,
             "payload" => %{"data" => random_string(tenant.max_payload_size_in_kb * 1000 + 1)}
           })
 
-          refute_receive %Phoenix.Socket.Broadcast{}, 500
+          refute_receive _any, 500
         end)
 
-      assert logs =~ "UnableToBroadcastChanges: %{messages: [%{payload: [\"Payload size exceeds tenant limit\"]}]}"
+      assert logs =~ "UnableToBroadcastChanges: :payload_size_exceeded"
+    end
+
+    test "message is not broadcast and logs error when rate limit is exceeded", %{tenant: tenant} do
+      events_per_second_rate = Tenants.events_per_second_rate(tenant)
+
+      # Start with a clean rate counter and push it well above the limit so the
+      # avg stays over the threshold for the full duration of the test.
+      RateCounterHelper.stop(tenant.external_id)
+      {:ok, _} = RateCounter.new(events_per_second_rate)
+      GenCounter.add(events_per_second_rate.id, tenant.max_events_per_second * 60 + 1)
+      {:ok, %{limit: %{triggered: true}}} = RateCounterHelper.tick!(events_per_second_rate)
+
+      logs =
+        capture_log(fn ->
+          start_supervised!(
+            {ReplicationConnection, %ReplicationConnection{tenant_id: tenant.external_id, monitored_pid: self()}},
+            restart: :transient
+          )
+
+          topic = random_string()
+          tenant_topic = Tenants.tenant_topic(tenant.external_id, topic, false)
+          assert :ok = Endpoint.subscribe(tenant_topic)
+
+          message_fixture(tenant, %{
+            "event" => "INSERT",
+            "topic" => topic,
+            "private" => true,
+            "payload" => %{"value" => random_string()}
+          })
+
+          refute_receive _any, 500
+        end)
+
+      assert logs =~ "UnableToBroadcastChanges: :too_many_requests"
     end
 
     test "payload without id", %{tenant: tenant, db_conn: db_conn} do
@@ -487,6 +523,108 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
                "value" => "something",
                "id" => id
              }
+    end
+
+    test "binary payload is replicated as UserBroadcast with binary encoding", %{tenant: tenant, db_conn: db_conn} do
+      start_link_supervised!(
+        {ReplicationConnection, %ReplicationConnection{tenant_id: tenant.external_id, monitored_pid: self()}},
+        restart: :transient
+      )
+
+      topic = random_string()
+      tenant_topic = Tenants.tenant_topic(tenant.external_id, topic, false)
+      assert :ok = Endpoint.subscribe(tenant_topic)
+
+      Realtime.Tenants.create_messages_partitions(db_conn)
+
+      binary = <<0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0xFF>>
+      event = "INSERT"
+
+      Postgrex.query!(
+        db_conn,
+        "SELECT realtime.send_binary($1::bytea, $2::text, $3::text, TRUE::bool);",
+        [binary, event, topic]
+      )
+
+      assert_receive %RealtimeWeb.Socket.UserBroadcast{
+                       user_event: ^event,
+                       user_payload_encoding: :binary,
+                       user_payload: ^binary,
+                       metadata: %{"id" => _id}
+                     },
+                     500
+    end
+
+    test "binary payload that exceeds payload size is not broadcast and logs error", %{tenant: tenant, db_conn: db_conn} do
+      logs =
+        capture_log(fn ->
+          start_supervised!(
+            {ReplicationConnection, %ReplicationConnection{tenant_id: tenant.external_id, monitored_pid: self()}},
+            restart: :transient
+          )
+
+          topic = random_string()
+          tenant_topic = Tenants.tenant_topic(tenant.external_id, topic, false)
+          assert :ok = Endpoint.subscribe(tenant_topic)
+
+          Realtime.Tenants.create_messages_partitions(db_conn)
+
+          binary = :binary.copy(<<0>>, tenant.max_payload_size_in_kb * 1000 + 1000)
+          event = "INSERT"
+
+          Postgrex.query!(
+            db_conn,
+            "SELECT realtime.send_binary($1::bytea, $2::text, $3::text, TRUE::bool);",
+            [binary, event, topic]
+          )
+
+          refute_receive _any, 500
+        end)
+
+      assert logs =~ "UnableToBroadcastChanges: :payload_size_exceeded"
+    end
+
+    test "empty binary payload is replicated as UserBroadcast with binary encoding", %{tenant: tenant, db_conn: db_conn} do
+      start_link_supervised!(
+        {ReplicationConnection, %ReplicationConnection{tenant_id: tenant.external_id, monitored_pid: self()}},
+        restart: :transient
+      )
+
+      topic = random_string()
+      tenant_topic = Tenants.tenant_topic(tenant.external_id, topic, false)
+      assert :ok = Endpoint.subscribe(tenant_topic)
+
+      Realtime.Tenants.create_messages_partitions(db_conn)
+
+      event = "INSERT"
+
+      Postgrex.query!(
+        db_conn,
+        "SELECT realtime.send_binary($1::bytea, $2::text, $3::text, TRUE::bool);",
+        [<<>>, event, topic]
+      )
+
+      assert_receive %RealtimeWeb.Socket.UserBroadcast{
+                       user_event: ^event,
+                       user_payload_encoding: :binary,
+                       user_payload: <<>>,
+                       metadata: %{"id" => _id}
+                     },
+                     500
+    end
+
+    test "rejects insert with both payload and binary_payload set", %{db_conn: db_conn} do
+      Realtime.Tenants.create_messages_partitions(db_conn)
+
+      assert {:error, %Postgrex.Error{postgres: %{code: :check_violation, constraint: "messages_payload_exclusive"}}} =
+               Postgrex.query(
+                 db_conn,
+                 """
+                 INSERT INTO realtime.messages (payload, binary_payload, event, topic, private, extension)
+                 VALUES ($1::jsonb, $2::bytea, 'evt', $3::text, false, 'broadcast')
+                 """,
+                 [%{"value" => "x"}, <<1, 2, 3>>, random_string()]
+               )
     end
 
     test "payload including id", %{tenant: tenant, db_conn: db_conn} do
@@ -544,7 +682,8 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
     end
 
     test "handle standby connections exceeds max_wal_senders", %{tenant: tenant} do
-      opts = Database.from_tenant(tenant, "realtime_test", :stop) |> Database.opts()
+      {:ok, settings} = Database.from_tenant(tenant, "realtime_test", :stop)
+      opts = Database.opts(settings)
       parent = self()
 
       # This creates a loop of errors that occupies all WAL senders and lets us test the error handling
@@ -553,7 +692,7 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
           replication_slot_opts =
             %PostgresReplication{
               connection_opts: opts,
-              table: :all,
+              table: "test",
               output_plugin: "pgoutput",
               output_plugin_options: [proto_version: "1", publication_names: "test_#{i}_publication"],
               handler_module: Replication.TestHandler,
@@ -624,6 +763,38 @@ defmodule Realtime.Tenants.ReplicationConnectionTest do
         end)
 
       refute logs =~ "Recreating"
+    end
+
+    test "disconnects when the publication cannot be created", %{tenant: tenant, db_conn: db_conn} do
+      publication_name = "supabase_realtime_messages_publication"
+
+      # No publication yet (forces the CREATE PUBLICATION path) and no table to publish,
+      # so `CREATE PUBLICATION ... FOR TABLE realtime.messages` fails with undefined_table.
+      Postgrex.query!(db_conn, "DROP PUBLICATION IF EXISTS #{publication_name}", [])
+      Postgrex.query!(db_conn, "DROP TABLE IF EXISTS realtime.messages CASCADE", [])
+
+      capture_log(fn ->
+        assert {:error, "Error creating publication:" <> _} = ReplicationConnection.start(tenant, self())
+      end)
+    end
+
+    test "disconnects when the publication cannot be recreated", %{tenant: tenant, db_conn: db_conn} do
+      publication_name = "supabase_realtime_messages_publication"
+
+      # Publication exists but with the wrong table, so validation triggers the
+      # `DROP ...; CREATE ...` recreate path. With realtime.messages gone, the CREATE half
+      # of that multi-statement fails, exercising the list-of-results error branch.
+      Postgrex.query!(db_conn, "DROP PUBLICATION IF EXISTS #{publication_name}", [])
+      Postgrex.query!(db_conn, "CREATE TABLE IF NOT EXISTS public.wrong_table (id int)", [])
+      Postgrex.query!(db_conn, "CREATE PUBLICATION #{publication_name} FOR TABLE public.wrong_table", [])
+      Postgrex.query!(db_conn, "DROP TABLE IF EXISTS realtime.messages CASCADE", [])
+
+      logs =
+        capture_log(fn ->
+          assert {:error, "Error creating publication:" <> _} = ReplicationConnection.start(tenant, self())
+        end)
+
+      assert logs =~ "Recreating"
     end
 
     test "if includes unexpected tables, recreates publication", %{tenant: tenant, db_conn: db_conn} do

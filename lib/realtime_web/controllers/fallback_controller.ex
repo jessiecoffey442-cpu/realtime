@@ -32,24 +32,12 @@ defmodule RealtimeWeb.FallbackController do
   end
 
   def call(conn, {:error, status, message}) when is_atom(status) and is_binary(message) do
-    log_error("UnprocessableEntity", message)
+    if status == :unprocessable_entity, do: log_error("UnprocessableEntity", message)
 
     conn
     |> put_status(status)
     |> put_view(RealtimeWeb.ErrorView)
     |> render("error.json", message: message)
-  end
-
-  def call(conn, {:error, %Ecto.Changeset{valid?: false} = changeset}) do
-    log_error(
-      "UnprocessableEntity",
-      Ecto.Changeset.traverse_errors(changeset, &translate_error/1)
-    )
-
-    conn
-    |> put_status(:unprocessable_entity)
-    |> put_view(RealtimeWeb.ChangesetView)
-    |> render("error.json", changeset: changeset)
   end
 
   def call(conn, {:error, _}) do

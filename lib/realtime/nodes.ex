@@ -65,7 +65,6 @@ defmodule Realtime.Nodes do
   Lists the nodes in a region. Sorts by node name in case the list order
   is unstable.
   """
-
   @spec region_nodes(String.t() | nil) :: [atom()]
   def region_nodes(region) when is_binary(region) do
     :syn.members(RegionNodes, region)
@@ -135,6 +134,9 @@ defmodule Realtime.Nodes do
                                         60
                                       )
 
+  @cache Realtime.Nodes.Cache
+  @node_load_ttl_ms @node_selection_time_bucket_seconds * 1_000
+
   defp load_aware_node_picker(regions_nodes, tenant_id) when is_binary(tenant_id) do
     case regions_nodes do
       nodes ->
@@ -191,7 +193,20 @@ defmodule Realtime.Nodes do
       else: :cpu_sup.avg5()
   end
 
-  def node_load(node) when node() != node, do: Realtime.GenRpc.call(node, __MODULE__, :node_load, [node], [])
+  def node_load(node) when node() != node do
+    {_, value} =
+      Cachex.fetch(@cache, node, fn _ ->
+        result = Realtime.GenRpc.call(node, __MODULE__, :node_load, [node], [])
+
+        case result do
+          result when is_number(result) -> {:commit, result, [expire: @node_load_ttl_ms]}
+          {:error, :not_enough_data} -> {:commit, result, [expire: @node_load_ttl_ms]}
+          _ -> {:ignore, result}
+        end
+      end)
+
+    value
+  end
 
   @doc """
   Gets a short node name from a node name when a node name looks like `realtime-prod@fdaa:0:cc:a7b:b385:83c3:cfe3:2`

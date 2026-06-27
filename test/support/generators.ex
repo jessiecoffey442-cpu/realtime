@@ -20,10 +20,16 @@ defmodule Generators do
           "settings" => %{
             "db_host" => "127.0.0.1",
             "db_name" => "postgres",
-            "db_user" => "supabase_admin",
+            "db_user" => System.get_env("DB_USER", "supabase_admin"),
             "db_password" => "postgres",
+            "db_user_realtime" =>
+              Realtime.Env.get_binary("DB_USER_REALTIME", fn ->
+                Realtime.Env.get_binary("DB_USER", "supabase_realtime_admin")
+              end),
+            "db_pass_realtime" =>
+              Realtime.Env.get_binary("DB_PASS_REALTIME", fn -> Realtime.Env.get_binary("DB_PASSWORD", "postgres") end),
             "db_port" => "#{override[:port] || port()}",
-            "poll_interval" => 100,
+            "poll_interval_ms" => 10,
             "poll_max_changes" => 100,
             "poll_max_record_bytes" => 1_048_576,
             "region" => "us-east-1",
@@ -48,7 +54,7 @@ defmodule Generators do
   @spec message_fixture(Realtime.Api.Tenant.t()) :: any()
   def message_fixture(tenant, override \\ %{}) do
     {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
-    Realtime.Tenants.Migrations.create_partitions(db_conn)
+    Realtime.Tenants.create_messages_partitions(db_conn)
 
     create_attrs = %{
       "topic" => random_string(),
@@ -228,6 +234,19 @@ defmodule Generators do
     """
   end
 
+  def policy_query(:authenticated_read_presence_for_sub, %{topic: name, sub: sub}) do
+    """
+    CREATE POLICY "authenticated_read_presence_for_sub_#{name}"
+    ON realtime.messages FOR SELECT
+    TO authenticated
+    USING (
+      realtime.topic() = '#{name}'
+      AND realtime.messages.extension = 'presence'
+      AND ((SELECT auth.uid())::text) = '#{sub}'
+    );
+    """
+  end
+
   def policy_query(:authenticated_read_broadcast_and_presence, %{topic: name}) do
     """
     CREATE POLICY "authenticated_read_presence_#{name}"
@@ -243,6 +262,19 @@ defmodule Generators do
     ON realtime.messages FOR INSERT
     TO authenticated
     WITH CHECK ( realtime.topic() = '#{name}' AND realtime.messages.extension IN ('presence', 'broadcast') );
+    """
+  end
+
+  def policy_query(:authenticated_read_presence_based_on_claim, %{topic: name}) do
+    """
+    CREATE POLICY "authenticated_read_presence_claim_#{name}"
+    ON realtime.messages FOR SELECT
+    TO authenticated
+    USING (
+      realtime.topic() = '#{name}'
+      AND realtime.messages.extension = 'presence'
+      AND coalesce(((current_setting('request.jwt.claims', true))::jsonb ->> 'presence_read')::boolean, false)
+    );
     """
   end
 

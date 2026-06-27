@@ -132,8 +132,6 @@ defmodule Realtime.Adapters.Postgres.Decoder do
     end
   end
 
-  require Logger
-
   @pg_epoch DateTime.from_iso8601("2000-01-01T00:00:00Z")
 
   alias Messages.Begin
@@ -276,6 +274,9 @@ defmodule Realtime.Adapters.Postgres.Decoder do
 
         "uuid" ->
           UUID.binary_to_string!(data)
+
+        "bytea" ->
+          data
       end
 
     decode_tuple_data(remainder, columns_remaining - 1, relations, [data | accumulator])

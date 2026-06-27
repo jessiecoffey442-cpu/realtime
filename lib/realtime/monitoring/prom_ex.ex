@@ -1,6 +1,7 @@
 defmodule Realtime.PromEx do
   alias Realtime.PromEx.Plugins.Distributed
   alias Realtime.PromEx.Plugins.GenRpc
+  alias Realtime.PromEx.Plugins.Migrations
   alias Realtime.PromEx.Plugins.OsMon
   alias Realtime.PromEx.Plugins.Phoenix
   alias Realtime.PromEx.Plugins.TenantGlobal
@@ -88,7 +89,7 @@ defmodule Realtime.PromEx do
         name: name,
         metrics: metrics,
         global_tags: Application.get_env(:realtime, :metrics_tags, %{}),
-        storage: {Realtime.Monitoring.Peep.Partitioned, 4}
+        storage: {Realtime.Monitoring.Peep.PartitionedTables, tables: 4, routing_tag: :tenant}
       )
     end
   end
@@ -101,6 +102,7 @@ defmodule Realtime.PromEx do
       {Plugins.Beam, poll_rate: poll_rate, metric_prefix: [:beam]},
       {Phoenix, router: RealtimeWeb.Router, poll_rate: poll_rate, metric_prefix: [:phoenix]},
       {OsMon, poll_rate: poll_rate},
+      {Migrations, poll_rate: poll_rate},
       {Tenants, poll_rate: poll_rate},
       {TenantGlobal, poll_rate: poll_rate},
       {Distributed, poll_rate: poll_rate},

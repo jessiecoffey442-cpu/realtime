@@ -7,6 +7,7 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
   alias Extensions.PostgresCdcRls.MessageDispatcher
   alias Extensions.PostgresCdcRls.ReplicationPoller, as: Poller
   alias Extensions.PostgresCdcRls.Replications
+  alias Extensions.PostgresCdcRls.Subscriptions
 
   alias Realtime.Adapters.Changes.{
     DeletedRecord,
@@ -27,9 +28,17 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
   describe "poll" do
     setup do
-      :telemetry.attach(
+      :telemetry.attach_many(
         __MODULE__,
-        [:realtime, :replication, :poller, :query, :stop],
+        [
+          [:realtime, :replication, :poller, :query, :stop],
+          [:realtime, :replication, :poller, :query, :exception],
+          [:realtime, :replication, :poller, :prepare, :exception],
+          [:realtime, :replication, :poller, :stop],
+          [:realtime, :replication, :poller, :exception],
+          [:realtime, :replication, :poller, :changes, :dispatch],
+          [:realtime, :replication, :poller, :changes, :skip]
+        ],
         &__MODULE__.handle_telemetry/4,
         pid: self()
       )
@@ -53,63 +62,11 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
       empty_results = {:ok, %Postgrex.Result{rows: [], num_rows: 0}}
       stub(Replications, :list_changes, fn _, _, _, _, _ -> empty_results end)
 
+      # Default to a publication with tables so the poller actually polls.
+      # Tests that need an empty publication override this stub explicitly.
+      stub(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{{"public", "test"} => [1234]}} end)
+
       %{args: args, tenant: tenant}
-    end
-
-    test "handles slot in use error and retries", %{args: args} do
-      tenant_id = args["id"]
-
-      slot_in_use_error =
-        {:error,
-         %Postgrex.Error{
-           postgres: %{
-             code: :object_in_use,
-             message: "replication slot is active for PID 12345"
-           }
-         }}
-
-      stub(Replications, :get_pg_stat_activity_diff, fn _conn, _pid -> {:error, :pid_not_found} end)
-      stub(Replications, :terminate_backend, fn _conn, _slot -> {:error, :slot_not_found} end)
-
-      expect(Replications, :list_changes, fn _, _, _, _, _ -> slot_in_use_error end)
-
-      start_link_supervised!({Poller, args})
-
-      assert_receive {
-                       :telemetry,
-                       [:realtime, :replication, :poller, :query, :stop],
-                       %{duration: _},
-                       %{tenant: ^tenant_id}
-                     },
-                     1000
-    end
-
-    test "handles slot in use error with pg_stat_activity returning diff", %{args: args} do
-      tenant_id = args["id"]
-
-      slot_in_use_error =
-        {:error,
-         %Postgrex.Error{
-           postgres: %{
-             code: :object_in_use,
-             message: "replication slot is active for PID 12345"
-           }
-         }}
-
-      stub(Replications, :get_pg_stat_activity_diff, fn _conn, _pid -> {:ok, 42} end)
-      stub(Replications, :terminate_backend, fn _conn, _slot -> {:error, :slot_not_found} end)
-
-      expect(Replications, :list_changes, fn _, _, _, _, _ -> slot_in_use_error end)
-
-      start_link_supervised!({Poller, args})
-
-      assert_receive {
-                       :telemetry,
-                       [:realtime, :replication, :poller, :query, :stop],
-                       %{duration: _},
-                       %{tenant: ^tenant_id}
-                     },
-                     1000
     end
 
     test "handles prepare_replication failure and retries", %{args: args} do
@@ -129,6 +86,35 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
                      2000
     end
 
+    test "gives up and stops when prepare_replication keeps failing", %{args: args} do
+      stub(Replications, :prepare_replication, fn _, _ -> {:error, "prepare failed"} end)
+
+      pid = start_supervised!({Poller, args}, restart: :temporary)
+      ref = Process.monitor(pid)
+
+      # Drive the retry count to the limit, then trigger one more failing prepare
+      :sys.replace_state(pid, fn state -> %{state | retry_count: 6} end)
+      send(pid, :retry)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :max_retries_reached}}, 1000
+    end
+
+    test "a fetch error on the prepare path goes through the retry machinery", %{args: args} do
+      # Start idle so no slot or poll loop is running.
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+
+      pid = start_supervised!({Poller, args}, restart: :temporary)
+      ref = Process.monitor(pid)
+
+      # A fetch error while preparing is treated like a prepare failure: at the retry
+      # limit, one more failing prepare stops the poller.
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:error, :boom} end)
+      :sys.replace_state(pid, fn state -> %{state | retry_count: 6} end)
+      send(pid, :retry)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :max_retries_reached}}, 1000
+    end
+
     test "terminates replication slot when retry count exceeds threshold", %{args: args} do
       tenant_id = args["id"]
 
@@ -143,7 +129,7 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
       stub(Replications, :get_pg_stat_activity_diff, fn _conn, _pid -> {:ok, 42} end)
       stub(Replications, :list_changes, fn _, _, _, _, _ -> slot_in_use_error end)
-      stub(Replications, :terminate_backend, fn _conn, _slot -> {:ok, :terminated} end)
+      expect(Replications, :terminate_backend, fn _conn, _slot -> {:ok, :terminated} end)
 
       pid = start_link_supervised!({Poller, args})
 
@@ -155,6 +141,25 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
       send(pid, :poll)
 
       assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 2000
+    end
+
+    test "gives up and stops after max retries", %{args: args} do
+      tenant_id = args["id"]
+      error = {:error, %Postgrex.Error{message: "boom"}}
+      stub(Replications, :list_changes, fn _, _, _, _, _ -> error end)
+
+      pid = start_supervised!({Poller, args}, restart: :temporary)
+      ref = Process.monitor(pid)
+
+      # Drive the retry count to the limit, then trigger one more failing poll
+      :sys.replace_state(pid, fn state -> %{state | retry_count: 6} end)
+      send(pid, :poll)
+
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :stop], %{duration: _},
+                      %{tenant: ^tenant_id, reason: {:shutdown, :max_retries_reached}}},
+                     1000
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :max_retries_reached}}, 1000
     end
 
     test "handles no new changes", %{args: args, tenant: tenant} do
@@ -391,6 +396,189 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
       assert {:ok, %RateCounter{sum: sum}} = RateCounterHelper.tick!(rate)
       assert sum == 3
     end
+
+    test "does not poll WAL when publication has no tables", %{args: args} do
+      tenant_id = args["id"]
+
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+      reject(&Replications.list_changes/5)
+
+      start_link_supervised!({Poller, args})
+
+      refute_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 200
+    end
+
+    test "drops replication slot and stops polling when tables vanish", %{args: args} do
+      tenant_id = args["id"]
+
+      expect(Replications, :drop_replication_slot, fn _conn, _slot -> {:ok, :dropped} end)
+
+      pid = start_link_supervised!({Poller, args})
+
+      # First poll happens with the default non-empty stub.
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 500
+
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+      reject(&Replications.list_changes/5)
+
+      send(pid, :check_oids)
+      # Force the GenServer to process :check_oids before we assert.
+      :sys.get_state(pid)
+
+      refute_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 200
+    end
+
+    test "cancels a pending retry when tables vanish so it can't recreate the slot", %{args: args} do
+      tenant_id = args["id"]
+
+      expect(Replications, :drop_replication_slot, fn _conn, _slot -> {:ok, :dropped} end)
+
+      pid = start_link_supervised!({Poller, args})
+
+      # First poll happens with the default non-empty stub.
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 500
+
+      # Simulate a retry already scheduled from a prior list_changes/5 error.
+      :sys.replace_state(pid, fn state ->
+        %{state | retry_ref: Process.send_after(pid, :retry, 50), retry_count: 3}
+      end)
+
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+      reject(&Replications.list_changes/5)
+
+      send(pid, :check_oids)
+
+      # retry_ref is cancelled/cleared and retry_count reset; no :retry fires.
+      assert %{retry_ref: nil, retry_count: 0} = :sys.get_state(pid)
+      refute_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 200
+    end
+
+    test "resumes polling when tables appear via :check_oids", %{args: args} do
+      tenant_id = args["id"]
+
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+
+      pid = start_link_supervised!({Poller, args})
+
+      refute_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 200
+
+      # Tables are added to the publication. Next :check_oids should trigger
+      # prepare_replication + an initial poll.
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{{"public", "test"} => [1234]}} end)
+      send(pid, :check_oids)
+
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 1000
+    end
+
+    test "a successful prepare resets a prior failure streak", %{args: args} do
+      tenant_id = args["id"]
+
+      # Start idle (empty publication) so no slot exists yet.
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+
+      pid = start_link_supervised!({Poller, args})
+
+      refute_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 200
+
+      # Simulate a leftover failure streak from earlier prepare/list_changes errors:
+      # a pending :retry and an inflated retry_count.
+      :sys.replace_state(pid, fn state ->
+        %{state | retry_ref: Process.send_after(pid, :retry, 60_000), retry_count: 5}
+      end)
+
+      # Tables appear: :check_oids re-runs prepare_replication, which succeeds and
+      # must wipe the failure streak.
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{{"public", "test"} => [1234]}} end)
+      send(pid, :check_oids)
+
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 1000
+
+      assert %{retry_ref: nil, retry_count: 0} = :sys.get_state(pid)
+    end
+
+    test "shuts down when slot drop fails so the temp slot is released with the connection",
+         %{args: args} do
+      pid = start_supervised!({Poller, args}, restart: :temporary)
+
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, _}, 500
+
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+      expect(Replications, :drop_replication_slot, fn _, _ -> {:error, :boom} end)
+
+      ref = Process.monitor(pid)
+      send(pid, :check_oids)
+
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :drop_replication_slot_failed}}, 1000
+    end
+
+    test "refreshes oids without touching the slot when the publication stays non-empty", %{args: args} do
+      tenant_id = args["id"]
+
+      # While the publication keeps having tables the slot must never be dropped
+      # or recreated; :check_oids only refreshes the oid map in place.
+      reject(&Replications.drop_replication_slot/2)
+
+      pid = start_link_supervised!({Poller, args})
+
+      # First poll happens with the default non-empty stub.
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 500
+
+      # Publication still has tables but the oid set changed (e.g. a table was added).
+      new_oids = %{{"public", "test"} => [1234], {"public", "other"} => [5678]}
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, new_oids} end)
+
+      send(pid, :check_oids)
+
+      # oids map is refreshed in place and the periodic check stays armed.
+      state = :sys.get_state(pid)
+      assert state.oids == new_oids
+      assert is_reference(state.check_oid_ref)
+    end
+
+    test "keeps oids and the slot when :check_oids fetch errors", %{args: args} do
+      tenant_id = args["id"]
+
+      # A fetch error must never be mistaken for an emptied publication, so the slot
+      # is left intact and the oid map is preserved.
+      reject(&Replications.drop_replication_slot/2)
+
+      pid = start_link_supervised!({Poller, args})
+
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 500
+
+      old_oids = :sys.get_state(pid).oids
+
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:error, :boom} end)
+      send(pid, :check_oids)
+
+      state = :sys.get_state(pid)
+      assert state.oids == old_oids
+      assert is_reference(state.check_oid_ref)
+    end
+
+    test "arms the periodic :check_oids timer when polling starts", %{args: args} do
+      tenant_id = args["id"]
+
+      pid = start_link_supervised!({Poller, args})
+
+      assert_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 500
+
+      assert is_reference(:sys.get_state(pid).check_oid_ref)
+    end
+
+    test "arms the periodic :check_oids timer even when the publication is empty", %{args: args} do
+      tenant_id = args["id"]
+
+      expect(Subscriptions, :fetch_publication_tables, fn _, _ -> {:ok, %{}} end)
+      reject(&Replications.list_changes/5)
+
+      pid = start_link_supervised!({Poller, args})
+
+      refute_receive {:telemetry, [:realtime, :replication, :poller, :query, :stop], _, %{tenant: ^tenant_id}}, 200
+
+      # Even idle (no slot), the poller must keep checking for tables to appear.
+      assert is_reference(:sys.get_state(pid).check_oid_ref)
+    end
   end
 
   @columns [
@@ -410,15 +598,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
   describe "generate_record/1" do
     test "INSERT" do
       wal_record = [
-        {"type", "INSERT"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", nil},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", []}
+        "INSERT",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        nil,
+        @ts,
+        [@subscription_id],
+        [],
+        1
       ]
 
       assert %NewRecord{
@@ -439,15 +628,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "UPDATE" do
       wal_record = [
-        {"type", "UPDATE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", []}
+        "UPDATE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        [],
+        1
       ]
 
       assert %UpdatedRecord{
@@ -470,15 +660,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "DELETE" do
       wal_record = [
-        {"type", "DELETE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", nil},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", []}
+        "DELETE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        nil,
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        [],
+        1
       ]
 
       assert %DeletedRecord{
@@ -499,15 +690,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "INSERT, large payload error present" do
       wal_record = [
-        {"type", "INSERT"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", nil},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", ["Error 413: Payload Too Large"]}
+        "INSERT",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        nil,
+        @ts,
+        [@subscription_id],
+        ["Error 413: Payload Too Large"],
+        1
       ]
 
       assert %NewRecord{
@@ -528,15 +720,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "INSERT, other errors present" do
       wal_record = [
-        {"type", "INSERT"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", nil},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", ["Error..."]}
+        "INSERT",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        nil,
+        @ts,
+        [@subscription_id],
+        ["Error..."],
+        1
       ]
 
       assert %NewRecord{
@@ -557,15 +750,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "UPDATE, large payload error present" do
       wal_record = [
-        {"type", "UPDATE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", ["Error 413: Payload Too Large"]}
+        "UPDATE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        ["Error 413: Payload Too Large"],
+        1
       ]
 
       assert %UpdatedRecord{
@@ -588,15 +782,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "UPDATE, other errors present" do
       wal_record = [
-        {"type", "UPDATE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", ["Error..."]}
+        "UPDATE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        ["Error..."],
+        1
       ]
 
       assert %UpdatedRecord{
@@ -619,15 +814,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "DELETE, large payload error present" do
       wal_record = [
-        {"type", "DELETE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", nil},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", ["Error 413: Payload Too Large"]}
+        "DELETE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        nil,
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        ["Error 413: Payload Too Large"],
+        1
       ]
 
       assert %DeletedRecord{
@@ -648,15 +844,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "DELETE, other errors present" do
       wal_record = [
-        {"type", "DELETE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", nil},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", ["Error..."]}
+        "DELETE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        nil,
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        ["Error..."],
+        1
       ]
 
       assert %DeletedRecord{
@@ -679,15 +876,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
   describe "generate_record/1 JSON encoding" do
     test "subscription_ids is excluded from JSON encoding for INSERT" do
       wal_record = [
-        {"type", "INSERT"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", nil},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", []}
+        "INSERT",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        nil,
+        @ts,
+        [@subscription_id],
+        [],
+        1
       ]
 
       record = generate_record(wal_record)
@@ -701,15 +899,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "subscription_ids is excluded from JSON encoding for UPDATE" do
       wal_record = [
-        {"type", "UPDATE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", Jason.encode!(@record)},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", []}
+        "UPDATE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        Jason.encode!(@record),
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        [],
+        1
       ]
 
       record = generate_record(wal_record)
@@ -721,15 +920,16 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
 
     test "subscription_ids is excluded from JSON encoding for DELETE" do
       wal_record = [
-        {"type", "DELETE"},
-        {"schema", "public"},
-        {"table", "todos"},
-        {"columns", Jason.encode!(@columns)},
-        {"record", nil},
-        {"old_record", Jason.encode!(@old_record)},
-        {"commit_timestamp", @ts},
-        {"subscription_ids", [@subscription_id]},
-        {"errors", []}
+        "DELETE",
+        "public",
+        "todos",
+        Jason.encode!(@columns),
+        nil,
+        Jason.encode!(@old_record),
+        @ts,
+        [@subscription_id],
+        [],
+        1
       ]
 
       record = generate_record(wal_record)
@@ -766,12 +966,12 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
     end
 
     test "stops cleanly when database connection fails", %{args: args} do
-      stub(Realtime.Database, :connect_db, fn _settings -> {:error, :econnrefused} end)
+      expect(Realtime.Database, :connect_db, fn _settings -> {:error, :econnrefused} end)
 
       pid = start_supervised!({Poller, args}, restart: :temporary)
       ref = Process.monitor(pid)
 
-      assert_receive {:DOWN, ^ref, :process, ^pid, :econnrefused}, 1000
+      assert_receive {:DOWN, ^ref, :process, ^pid, {:shutdown, :econnrefused}}, 1000
     end
   end
 
@@ -808,7 +1008,8 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
          "old_record",
          "commit_timestamp",
          "subscription_ids",
-         "errors"
+         "errors",
+         "slot_changes_count"
        ],
        rows: [
          [
@@ -820,7 +1021,8 @@ defmodule Realtime.Extensions.PostgresCdcRls.ReplicationPollerTest do
            nil,
            "2025-10-13T07:50:28.066Z",
            subscription_ids,
-           []
+           [],
+           1
          ]
        ],
        num_rows: 1,

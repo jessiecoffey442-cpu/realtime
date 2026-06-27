@@ -2,7 +2,32 @@ start_time = :os.system_time(:millisecond)
 
 alias Realtime.Api
 max_cases = String.to_integer(System.get_env("MAX_CASES", "4"))
-ExUnit.start(exclude: [:failing], max_cases: max_cases, capture_log: true)
+
+repo_config = Application.fetch_env!(:realtime, Realtime.Repo)
+
+{:ok, pg_conn} =
+  Postgrex.start_link(
+    hostname: repo_config[:hostname],
+    port: repo_config[:port] || 5432,
+    username: repo_config[:username],
+    password: repo_config[:password],
+    database: "postgres"
+  )
+
+%{rows: [[pg_version_num]]} = Postgrex.query!(pg_conn, "SELECT current_setting('server_version_num')::int")
+
+%{rows: [[has_supautils_subscription_grants]]} =
+  Postgrex.query!(pg_conn, "SELECT current_setting('supautils.policy_grants', true) LIKE '%realtime.subscription%'")
+
+# `realtime.broadcast_changes(..., NEW record, OLD record, ...)` (introduced in commit 2922658c) called from a trigger via `PERFORM` fails on PG <= 14.5
+requires_pg_140006 = if pg_version_num < 140_006, do: :requires_pg_140006
+
+# Restriction assertions on the postgres role only hold on builds where supautils.policy_grants includes realtime.subscription (supabase/postgres 15.14.1.018 or higher)
+requires_supautils_policy_grants = if !has_supautils_subscription_grants, do: :requires_supautils_policy_grants
+
+exclude = [:failing, requires_pg_140006, requires_supautils_policy_grants]
+
+ExUnit.start(exclude: exclude, max_cases: max_cases, capture_log: true)
 
 max_cases = ExUnit.configuration()[:max_cases]
 
@@ -19,10 +44,12 @@ for tenant <- Api.list_tenants(), do: Api.delete_tenant_by_external_id(tenant.ex
 Ecto.Adapters.SQL.Sandbox.mode(Realtime.Repo, :manual)
 
 Mimic.copy(:syn)
+Mimic.copy(Ecto.Migrator)
 Mimic.copy(Extensions.PostgresCdcRls)
 Mimic.copy(Extensions.PostgresCdcRls.Replications)
 Mimic.copy(Extensions.PostgresCdcRls.Subscriptions)
 Mimic.copy(Realtime.Database)
+Mimic.copy(Realtime.FeatureFlags)
 Mimic.copy(Realtime.GenCounter)
 Mimic.copy(Realtime.GenRpc)
 Mimic.copy(Realtime.Nodes)
@@ -30,10 +57,12 @@ Mimic.copy(Realtime.Repo.Replica)
 Mimic.copy(Realtime.RateCounter)
 Mimic.copy(Realtime.Tenants.Authorization)
 Mimic.copy(Realtime.Tenants.Cache)
+Mimic.copy(Realtime.Tenants.Repo)
 Mimic.copy(Realtime.Tenants.Connect)
 Mimic.copy(Realtime.Tenants.Migrations)
 Mimic.copy(Realtime.Tenants.Rebalancer)
 Mimic.copy(Realtime.Tenants.ReplicationConnection)
+Mimic.copy(Realtime.UsersCounter)
 Mimic.copy(RealtimeWeb.ChannelsAuthorization)
 Mimic.copy(RealtimeWeb.Endpoint)
 Mimic.copy(RealtimeWeb.JwtVerification)

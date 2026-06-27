@@ -4,6 +4,7 @@ defmodule Realtime.Application do
   @moduledoc false
 
   use Application
+  require Cachex.Spec
   require Logger
 
   alias Realtime.Repo.Replica
@@ -62,6 +63,8 @@ defmodule Realtime.Application do
 
     set_persist_storage(RealtimeWeb.UserSocket, :realtime, :websocket_max_heap_size)
     set_persist_storage(RealtimeWeb.UserSocket, :realtime, :measure_traffic_interval_in_ms)
+    set_persist_storage(RealtimeWeb.UserSocket, :realtime, :connect_error_backoff_ms)
+    set_persist_storage(RealtimeWeb.RealtimeChannel, :realtime, :channel_error_backoff_ms)
 
     :syn.set_event_handler(Realtime.SynHandler)
     :ok = :syn.add_node_to_scopes([RegionNodes, Realtime.Tenants.Connect])
@@ -97,25 +100,34 @@ defmodule Realtime.Application do
         {Cluster.Supervisor, [topologies, [name: Realtime.ClusterSupervisor]]},
         {Phoenix.PubSub,
          name: Realtime.PubSub, pool_size: 10, adapter: pubsub_adapter(), broadcast_pool_size: broadcast_pool_size},
-        {Beacon,
+        {Forum.Census,
          [
            :users,
            [
              partitions: user_scope_shards,
              broadcast_interval_in_ms: user_scope_broadast_interval_in_ms,
-             message_module: Realtime.BeaconPubSubAdapter
+             message_module: Realtime.ForumPubSubAdapter
            ]
          ]},
-        {Cachex, name: Realtime.RateCounter},
+        Supervisor.child_spec({Cachex, name: Realtime.RateCounter}, id: Realtime.RateCounter),
+        Supervisor.child_spec({Cachex, name: Realtime.Nodes.Cache}, id: Realtime.Nodes.Cache),
+        Supervisor.child_spec(
+          {Cachex,
+           name: Realtime.LogThrottle,
+           expiration:
+             Cachex.Spec.expiration(
+               interval: Application.get_env(:realtime, :log_throttle_janitor_interval_ms, :timer.minutes(10))
+             )},
+          id: Realtime.LogThrottle
+        ),
         Realtime.Tenants.Cache,
+        Realtime.FeatureFlags.Cache,
         Realtime.RateCounter.DynamicSupervisor,
         Realtime.Latency,
         {Registry, keys: :duplicate, name: Realtime.Registry},
         {Registry, keys: :unique, name: Realtime.Registry.Unique},
         {Registry, keys: :unique, name: Realtime.Tenants.Connect.Registry},
         {Registry, keys: :unique, name: Extensions.PostgresCdcRls.ReplicationPoller.Registry},
-        {Registry,
-         keys: :duplicate, partitions: System.schedulers_online() * 2, name: RealtimeWeb.SocketDisconnect.Registry},
         {Task.Supervisor, name: Realtime.TaskSupervisor},
         {Task.Supervisor, name: Realtime.Tenants.Migrations.TaskSupervisor},
         {PartitionSupervisor,
@@ -136,6 +148,7 @@ defmodule Realtime.Application do
         {RealtimeWeb.RealtimeChannel.Tracker, check_interval_in_ms: no_channel_timeout_in_ms},
         RealtimeWeb.Endpoint,
         {RealtimeWeb.Presence,
+         log_level: :info,
          pool_size: presence_pool_size,
          broadcast_period: presence_broadcast_period,
          permdown_period: presence_permdown_period}

@@ -8,6 +8,19 @@ defmodule Realtime.DatabaseTest do
   doctest Realtime.Database
   def handle_telemetry(event, metadata, content, pid: pid), do: send(pid, {event, metadata, content})
 
+  defp encrypted_settings(extra \\ %{}) do
+    Map.merge(
+      %{
+        "db_host" => Realtime.Crypto.encrypt!("127.0.0.1"),
+        "db_port" => Realtime.Crypto.encrypt!("5432"),
+        "db_name" => Realtime.Crypto.encrypt!("postgres"),
+        "db_user" => Realtime.Crypto.encrypt!("supabase_admin"),
+        "db_password" => Realtime.Crypto.encrypt!("super-pass")
+      },
+      extra
+    )
+  end
+
   setup do
     tenant = Containers.checkout_tenant()
     :telemetry.attach(__MODULE__, [:realtime, :database, :transaction], &__MODULE__.handle_telemetry/4, pid: self())
@@ -24,7 +37,7 @@ defmodule Realtime.DatabaseTest do
         "settings" => %{
           "db_host" => "127.0.0.1",
           "db_name" => "postgres",
-          "db_user" => "supabase_admin",
+          "db_user" => "supabase_realtime_admin",
           "db_password" => "postgres",
           "region" => "us-east-1",
           "ssl_enforced" => false,
@@ -72,20 +85,14 @@ defmodule Realtime.DatabaseTest do
          %{tenant: tenant} do
       assert capture_log(fn ->
                assert {:error, :tenant_db_too_many_connections} = Database.check_tenant_connection(tenant)
-             end) =~ ~r/Only \d+ available connections\. At least 126 connections are required/
+             end) =~ ~r/Only \d+ available connections\. At least 125 connections are required/
     end
   end
 
   describe "replication_slot_teardown/1" do
     test "removes replication slots with the realtime prefix", %{tenant: tenant} do
       {:ok, conn} = Database.connect(tenant, "realtime_test", :stop)
-
-      Postgrex.query!(
-        conn,
-        "SELECT * FROM pg_create_logical_replication_slot('realtime_test_slot', 'pgoutput')",
-        []
-      )
-
+      Postgrex.query!(conn, "SELECT * FROM pg_create_logical_replication_slot('realtime_test_slot', 'pgoutput')", [])
       Database.replication_slot_teardown(tenant)
       assert %{rows: []} = Postgrex.query!(conn, "SELECT slot_name FROM pg_replication_slots", [])
     end
@@ -95,13 +102,7 @@ defmodule Realtime.DatabaseTest do
     test "removes replication slots with a given name and existing connection", %{tenant: tenant} do
       name = String.downcase("slot_#{random_string()}")
       {:ok, conn} = Database.connect(tenant, "realtime_test", :stop)
-
-      Postgrex.query!(
-        conn,
-        "SELECT * FROM pg_create_logical_replication_slot('#{name}', 'pgoutput')",
-        []
-      )
-
+      Postgrex.query!(conn, "SELECT * FROM pg_create_logical_replication_slot('#{name}', 'pgoutput')", [])
       Database.replication_slot_teardown(conn, name)
       Process.sleep(1000)
       assert %{rows: []} = Postgrex.query!(conn, "SELECT slot_name FROM pg_replication_slots", [])
@@ -110,13 +111,7 @@ defmodule Realtime.DatabaseTest do
     test "removes replication slots with a given name and a tenant", %{tenant: tenant} do
       name = String.downcase("slot_#{random_string()}")
       {:ok, conn} = Database.connect(tenant, "realtime_test", :stop)
-
-      Postgrex.query!(
-        conn,
-        "SELECT * FROM pg_create_logical_replication_slot('#{name}', 'pgoutput')",
-        []
-      )
-
+      Postgrex.query!(conn, "SELECT * FROM pg_create_logical_replication_slot('#{name}', 'pgoutput')", [])
       Database.replication_slot_teardown(tenant, name)
       assert %{rows: []} = Postgrex.query!(conn, "SELECT slot_name FROM pg_replication_slots", [])
     end
@@ -129,7 +124,7 @@ defmodule Realtime.DatabaseTest do
         "settings" => %{
           "db_host" => "127.0.0.1",
           "db_name" => "postgres",
-          "db_user" => "supabase_admin",
+          "db_user" => "supabase_realtime_admin",
           "db_password" => "postgres",
           "region" => "us-east-1",
           "ssl_enforced" => false,
@@ -144,7 +139,7 @@ defmodule Realtime.DatabaseTest do
     end
 
     test "handles transaction errors", %{db_conn: db_conn} do
-      assert {:error, %DBConnection.ConnectionError{reason: :error}} =
+      assert {:error, %Postgrex.Error{postgres: %{code: :admin_shutdown}}} =
                Database.transaction(db_conn, fn conn ->
                  Postgrex.query!(conn, "select pg_terminate_backend(pg_backend_pid())", [])
                end)
@@ -184,8 +179,7 @@ defmodule Realtime.DatabaseTest do
 
     test "handles exit signals in transactions", %{db_conn: db_conn} do
       assert capture_log(fn ->
-               assert {:error, {:exit, _}} =
-                        Database.transaction(db_conn, fn _conn -> exit(:test_exit) end)
+               assert {:error, {:exit, _}} = Database.transaction(db_conn, fn _conn -> exit(:test_exit) end)
              end) =~ "ErrorExecutingTransaction"
     end
 
@@ -246,36 +240,14 @@ defmodule Realtime.DatabaseTest do
       assert Database.pool_size_by_application_name("realtime_connect", %{"db_pool" => 10}) == 10
       assert Database.pool_size_by_application_name("realtime_potato", %{}) == 1
       assert Database.pool_size_by_application_name("realtime_rls", %{"db_pool" => 10}) == 1
-
-      assert Database.pool_size_by_application_name("realtime_rls", %{"subs_pool_size" => 10}) ==
-               1
-
-      assert Database.pool_size_by_application_name("realtime_rls", %{"subcriber_pool_size" => 10}) ==
-               1
-
-      assert Database.pool_size_by_application_name("realtime_broadcast_changes", %{
-               "db_pool" => 10
-             }) == 1
-
-      assert Database.pool_size_by_application_name("realtime_broadcast_changes", %{
-               "subs_pool_size" => 10
-             }) == 1
-
-      assert Database.pool_size_by_application_name("realtime_broadcast_changes", %{
-               "subcriber_pool_size" => 10
-             }) == 1
-
-      assert Database.pool_size_by_application_name("realtime_migrations", %{
-               "db_pool" => 10
-             }) == 2
-
-      assert Database.pool_size_by_application_name("realtime_migrations", %{
-               "subs_pool_size" => 10
-             }) == 2
-
-      assert Database.pool_size_by_application_name("realtime_migrations", %{
-               "subcriber_pool_size" => 10
-             }) == 2
+      assert Database.pool_size_by_application_name("realtime_rls", %{"subs_pool_size" => 10}) == 1
+      assert Database.pool_size_by_application_name("realtime_rls", %{"subcriber_pool_size" => 10}) == 1
+      assert Database.pool_size_by_application_name("realtime_broadcast_changes", %{"db_pool" => 10}) == 1
+      assert Database.pool_size_by_application_name("realtime_broadcast_changes", %{"subs_pool_size" => 10}) == 1
+      assert Database.pool_size_by_application_name("realtime_broadcast_changes", %{"subcriber_pool_size" => 10}) == 1
+      assert Database.pool_size_by_application_name("realtime_migrations", %{"db_pool" => 10}) == 2
+      assert Database.pool_size_by_application_name("realtime_migrations", %{"subs_pool_size" => 10}) == 2
+      assert Database.pool_size_by_application_name("realtime_migrations", %{"subcriber_pool_size" => 10}) == 2
     end
   end
 
@@ -290,54 +262,23 @@ defmodule Realtime.DatabaseTest do
   describe "detect_ip_version/1" do
     test "detects appropriate IP version" do
       # Using ipv4.google.com
-      log =
-        capture_log(fn ->
-          assert Realtime.Database.detect_ip_version("ipv4.google.com") == {:ok, :inet}
-        end)
-
-      assert log =~ "IpV4Detected"
-      assert log =~ ~r/resolved to \d+\.\d+\.\d+\.\d+/
+      assert Realtime.Database.detect_ip_version("ipv4.google.com") == {:ok, :inet}
 
       # Using ipv6.google.com
-      log =
-        capture_log(fn ->
-          assert Realtime.Database.detect_ip_version("ipv6.google.com") == {:ok, :inet6}
-        end)
-
-      refute log =~ "IpV4Detected"
-
-      # Using 2001:0db8:85a3:0000:0000:8a2e:0370:7334
-      log =
-        capture_log(fn ->
-          assert Realtime.Database.detect_ip_version("2001:0db8:85a3:0000:0000:8a2e:0370:7334") ==
-                   {:ok, :inet6}
-        end)
-
-      refute log =~ "IpV4Detected"
+      assert Realtime.Database.detect_ip_version("ipv6.google.com") == {:ok, :inet6}
+      assert Realtime.Database.detect_ip_version("2001:0db8:85a3:0000:0000:8a2e:0370:7334") == {:ok, :inet6}
 
       # Using 127.0.0.1
-      log =
-        capture_log(fn ->
-          assert Realtime.Database.detect_ip_version("127.0.0.1") == {:ok, :inet}
-        end)
-
-      assert log =~ "IpV4Detected"
-      assert log =~ ~r/resolved to \d+\.\d+\.\d+\.\d+/
+      assert Realtime.Database.detect_ip_version("127.0.0.1") == {:ok, :inet}
 
       # Using invalid domain
-      #       # Using 127.0.0.1
-      log =
-        capture_log(fn ->
-          assert Realtime.Database.detect_ip_version("potato") == {:error, :nxdomain}
-        end)
-
-      refute log =~ "IpV4Detected"
+      assert Realtime.Database.detect_ip_version("potato") == {:error, :nxdomain}
     end
   end
 
   describe "from_tenant/3" do
     test "uses default backoff when not provided", %{tenant: tenant} do
-      settings = Database.from_tenant(tenant, "realtime_test")
+      {:ok, settings} = Database.from_tenant(tenant, "realtime_test")
       assert settings.backoff_type == :rand_exp
     end
   end
@@ -345,7 +286,7 @@ defmodule Realtime.DatabaseTest do
   describe "from_settings/3" do
     test "uses default backoff when not provided", %{tenant: tenant} do
       settings = Realtime.PostgresCdc.filter_settings("postgres_cdc_rls", tenant.extensions)
-      result = Database.from_settings(settings, "realtime_connect")
+      {:ok, result} = Database.from_settings(settings, "realtime_connect")
       assert result.backoff_type == :rand_exp
     end
 
@@ -355,7 +296,13 @@ defmodule Realtime.DatabaseTest do
       {:ok, ip_version} = Database.detect_ip_version("127.0.0.1")
       socket_options = [ip_version]
       settings = Realtime.PostgresCdc.filter_settings("postgres_cdc_rls", tenant.extensions)
-      settings = Database.from_settings(settings, application_name, backoff)
+
+      username =
+        Realtime.Env.get_binary("DB_USER_REALTIME", fn ->
+          Realtime.Env.get_binary("DB_USER", "supabase_realtime_admin")
+        end)
+
+      {:ok, settings} = Database.from_settings(settings, application_name, backoff)
       port = settings.port
 
       assert %Realtime.Database{
@@ -365,7 +312,7 @@ defmodule Realtime.DatabaseTest do
                hostname: "127.0.0.1",
                port: ^port,
                database: "postgres",
-               username: "supabase_admin",
+               username: ^username,
                password: "postgres",
                pool_size: 1,
                queue_target: 5000,
@@ -375,8 +322,8 @@ defmodule Realtime.DatabaseTest do
     end
 
     test "defaults ssl to true when ssl_enforced is not set" do
-      assert Database.default_ssl_param(%{}) == true
-      assert Database.default_ssl_param(%{"other" => "value"}) == true
+      assert Database.default_ssl_param(%{})
+      assert Database.default_ssl_param(%{"other" => "value"})
     end
 
     test "handles SSL properties", %{tenant: tenant} do
@@ -385,23 +332,113 @@ defmodule Realtime.DatabaseTest do
 
       settings = Realtime.PostgresCdc.filter_settings("postgres_cdc_rls", tenant.extensions)
       settings = Map.put(settings, "ssl_enforced", true)
-      settings = Database.from_settings(settings, application_name, backoff)
+      {:ok, settings} = Database.from_settings(settings, application_name, backoff)
       assert settings.ssl == [verify: :verify_none]
 
       settings = Realtime.PostgresCdc.filter_settings("postgres_cdc_rls", tenant.extensions)
       settings = Map.put(settings, "ssl_enforced", false)
-      settings = Database.from_settings(settings, application_name, backoff)
-      assert settings.ssl == false
+      {:ok, settings} = Database.from_settings(settings, application_name, backoff)
+      refute settings.ssl
+    end
+
+    test "runtime connections use db_user_realtime when present" do
+      settings =
+        encrypted_settings(%{
+          "db_user_realtime" => Realtime.Crypto.encrypt!("supabase_realtime_admin"),
+          "db_pass_realtime" => Realtime.Crypto.encrypt!("realtime-pass")
+        })
+
+      assert {:ok, %{username: "supabase_realtime_admin", password: "realtime-pass"}} =
+               Database.from_settings(settings, "realtime_connect", :stop)
+    end
+
+    test "runtime connections fall back to db_user when db_user_realtime is absent" do
+      assert {:ok, %{username: "supabase_admin", password: "super-pass"}} =
+               Database.from_settings(encrypted_settings(), "realtime_connect", :stop)
+    end
+
+    test "realtime_migrations always uses db_user even when db_user_realtime is set" do
+      settings =
+        encrypted_settings(%{
+          "db_user_realtime" => Realtime.Crypto.encrypt!("supabase_realtime_admin"),
+          "db_pass_realtime" => Realtime.Crypto.encrypt!("realtime-pass")
+        })
+
+      assert {:ok, %{username: "supabase_admin", password: "super-pass"}} =
+               Database.from_settings(settings, "realtime_migrations", :stop)
+    end
+  end
+
+  describe "check_replication_slot_lag/2" do
+    setup %{tenant: tenant} do
+      {:ok, db_conn} = Database.connect(tenant, "realtime_test", :stop)
+      suffix = System.unique_integer([:positive])
+      slot_name = "test_lag_#{suffix}"
+      table_name = "lag_test_#{suffix}"
+
+      Postgrex.query!(db_conn, "SELECT pg_create_logical_replication_slot($1, 'pgoutput')", [slot_name])
+      Postgrex.query!(db_conn, "CREATE TABLE IF NOT EXISTS #{table_name} (id INT, data TEXT)", [])
+
+      on_exit(fn ->
+        case Database.connect(tenant, "realtime_test_cleanup", :stop) do
+          {:ok, conn} ->
+            Postgrex.query(conn, "SELECT pg_drop_replication_slot($1)", [slot_name])
+            Postgrex.query(conn, "DROP TABLE IF EXISTS #{table_name} CASCADE", [])
+            GenServer.stop(conn)
+
+          _ ->
+            :ok
+        end
+      end)
+
+      %{db_conn: db_conn, slot_name: slot_name, table_name: table_name}
+    end
+
+    test "returns :ok when slot lag is below threshold", %{db_conn: db_conn, slot_name: slot_name} do
+      assert :ok == Database.check_replication_slot_lag(db_conn, slot_name)
+    end
+
+    test "returns :ok when slot lag is non-zero but below threshold", %{
+      db_conn: db_conn,
+      slot_name: slot_name,
+      table_name: table_name
+    } do
+      # Generate ~40% of the 32MB max_slot_wal_keep_size (test container value) by inserting
+      # ~50k rows of 200 bytes each — produces roughly 12-13MB of WAL, safely under the 16MB
+      # (50%) shutdown threshold. The slot is inactive so restart_lsn stays pinned.
+      Postgrex.query!(
+        db_conn,
+        "INSERT INTO #{table_name} SELECT generate_series(1, 50000), repeat('x', 200)",
+        []
+      )
+
+      assert :ok == Database.check_replication_slot_lag(db_conn, slot_name)
+    end
+
+    test "returns {:error, :lag_too_high} when slot is far behind", %{
+      db_conn: db_conn,
+      slot_name: slot_name,
+      table_name: table_name
+    } do
+      # Generate >16MB of WAL (50% of the 32MB max_slot_wal_keep_size in test containers).
+      # The slot is inactive so restart_lsn stays pinned at creation LSN.
+      Postgrex.query!(
+        db_conn,
+        "INSERT INTO #{table_name} SELECT generate_series(1, 100000), repeat('x', 200)",
+        []
+      )
+
+      assert {:error, :lag_too_high} == Database.check_replication_slot_lag(db_conn, slot_name)
+    end
+
+    test "returns :ok for unknown slot", %{db_conn: db_conn} do
+      assert :ok == Database.check_replication_slot_lag(db_conn, "nonexistent_slot_xyz")
     end
   end
 
   defp update_extension(tenant, extension) do
     db_port = Realtime.Crypto.decrypt!(hd(tenant.extensions).settings["db_port"])
-
-    extensions = [
-      put_in(extension, ["settings", "db_port"], db_port)
-    ]
-
+    extensions = [put_in(extension, ["settings", "db_port"], db_port)]
     Realtime.Api.update_tenant_by_external_id(tenant.external_id, %{extensions: extensions})
   end
 end

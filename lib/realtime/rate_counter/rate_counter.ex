@@ -4,6 +4,8 @@ defmodule Realtime.RateCounter do
 
   These rate counters use the GenCounter module.
   Start your RateCounter here and increment it with a `GenCounter.add/1` call, for example.
+
+  Average is calculated as the average number of events per second
   """
 
   use GenServer
@@ -20,7 +22,7 @@ defmodule Realtime.RateCounter do
     defstruct id: nil, opts: []
   end
 
-  @idle_shutdown :timer.minutes(10)
+  @idle_shutdown :timer.minutes(5)
   @tick :timer.seconds(1)
   @max_bucket_len 60
   @cache __MODULE__
@@ -208,7 +210,8 @@ defmodule Realtime.RateCounter do
     bucket_len = Enum.count(bucket)
 
     sum = Enum.sum(bucket)
-    avg = sum / bucket_len
+
+    avg = sum / bucket_len / (state.tick / 1_000)
 
     state = %{state | bucket: bucket, sum: sum, avg: avg}
 
@@ -223,7 +226,7 @@ defmodule Realtime.RateCounter do
   def handle_info(:idle_shutdown, state) do
     if Enum.all?(state.bucket, &(&1 == 0)) do
       # All the buckets are empty, so we can assume this RateCounter has not been useful recently
-      Logger.warning("#{__MODULE__} idle_shutdown reached for: #{inspect(state.id)}")
+      Logger.info("#{__MODULE__} idle_shutdown reached for: #{inspect(state.id)}")
       shutdown(state)
     else
       Process.cancel_timer(state.idle_shutdown_ref)

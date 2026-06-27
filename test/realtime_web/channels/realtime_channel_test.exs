@@ -23,6 +23,25 @@ defmodule RealtimeWeb.RealtimeChannelTest do
 
   setup :rls_context
 
+  describe "join - tenant not found" do
+    test "sends disconnect to transport_pid and logs TenantNotFound", %{tenant: tenant} do
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{}, conn_opts(tenant, jwt))
+
+      stub(Realtime.Tenants.Cache, :fetch_tenant_by_external_id, fn _id ->
+        {:error, :tenant_not_found}
+      end)
+
+      log =
+        capture_log(fn ->
+          assert {:error, _} = subscribe_and_join(socket, "realtime:test", %{})
+        end)
+
+      assert log =~ "TenantNotFound"
+      assert_received %Phoenix.Socket.Broadcast{event: "disconnect"}
+    end
+  end
+
   describe "process flags" do
     test "max heap size is set for both transport and channel processes", %{tenant: tenant} do
       jwt = Generators.generate_jwt_token(tenant)
@@ -205,7 +224,7 @@ defmodule RealtimeWeb.RealtimeChannelTest do
       assert_push "system",
                   %{
                     message:
-                      "Unable to subscribe to changes with given parameters. Please check Realtime is enabled for the given connect parameters: [event: *, schema: public, table: doesnotexist, filters: []]",
+                      "Unable to subscribe to changes with given parameters. Please check Realtime is enabled for the given connect parameters: [event: *, schema: public, table: doesnotexist, filters: [], select: nil]",
                     status: "error",
                     extension: "postgres_changes",
                     channel: "test"
@@ -235,7 +254,7 @@ defmodule RealtimeWeb.RealtimeChannelTest do
       assert_push "system",
                   %{
                     message:
-                      "Unable to subscribe to changes with given parameters. An exception happened so please check your connect parameters: [event: *, schema: public, table: test, filters: [{\"notacolumn\", \"eq\", \"123\"}]]. Exception: ERROR P0001 (raise_exception) invalid column for filter notacolumn",
+                      "Unable to subscribe to changes with given parameters. An exception happened so please check your connect parameters: [event: *, schema: public, table: test, filters: [{\"notacolumn\", \"eq\", \"123\", false}], select: nil]. Exception: ERROR P0001 (raise_exception) invalid column for filter notacolumn",
                     status: "error",
                     extension: "postgres_changes",
                     channel: "test"
@@ -614,6 +633,29 @@ defmodule RealtimeWeb.RealtimeChannelTest do
                      500
     end
 
+    test "presence track with non-map payload replies with error and keeps socket alive", %{tenant: tenant} do
+      topic = "realtime:test"
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{"log_level" => "warning"}, conn_opts(tenant, jwt))
+
+      assert {:ok, _, %Socket{} = socket} =
+               subscribe_and_join(socket, topic, %{"config" => %{"presence" => %{"enabled" => true}}})
+
+      assert_receive %Phoenix.Socket.Message{topic: "realtime:test", event: "presence_state"}, 500
+
+      ref = push(socket, "presence", %{"type" => "presence", "event" => "TRACK", "payload" => "not a map"})
+
+      assert_receive %Socket.Reply{
+                       ref: ^ref,
+                       status: :error,
+                       payload: %{reason: "Presence track payload must be a map"}
+                     },
+                     500
+
+      ref = push(socket, "presence", %{"type" => "presence", "event" => "TRACK", "payload" => %{"user" => "a"}})
+      assert_receive %Socket.Reply{ref: ^ref, status: :ok}, 500
+    end
+
     test "presence track with same payload does nothing", %{tenant: tenant} do
       topic = "realtime:test"
       jwt = Generators.generate_jwt_token(tenant)
@@ -702,18 +744,59 @@ defmodule RealtimeWeb.RealtimeChannelTest do
              end) =~ "UnknownErrorOnChannel: Realtime was unable to connect to the project database"
     end
 
-    test "unexpected error while setting policies", %{tenant: tenant} do
+    test "unexpected error while setting policies logs UnknownErrorOnChannel", %{tenant: tenant} do
       jwt = Generators.generate_jwt_token(tenant)
       {:ok, %Socket{} = socket} = connect(UserSocket, %{}, conn_opts(tenant, jwt))
 
       expect(Authorization, :get_read_authorizations, fn _, _, _, _ ->
-        {:error, "Realtime was unable to connect to the project database"}
+        {:error, "unexpected error"}
+      end)
+
+      assert capture_log(fn ->
+               assert {:error, %{reason: "Unknown Error on Channel"}} =
+                        subscribe_and_join(socket, "realtime:test", %{"config" => %{"private" => true}})
+             end) =~ "UnknownErrorOnChannel"
+    end
+
+    test "struct error while setting policies logs UnableToSetPolicies", %{tenant: tenant} do
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{}, conn_opts(tenant, jwt))
+
+      expect(Authorization, :get_read_authorizations, fn _, _, _, _ ->
+        {:error, %DBConnection.ConnectionError{message: "unexpected error", reason: :error, severity: :error}}
       end)
 
       assert capture_log(fn ->
                assert {:error, %{reason: "Realtime was unable to connect to the project database"}} =
                         subscribe_and_join(socket, "realtime:test", %{"config" => %{"private" => true}})
              end) =~ "UnableToSetPolicies"
+    end
+
+    test "query canceled during join logs QueryCanceled", %{tenant: tenant} do
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{}, conn_opts(tenant, jwt))
+
+      expect(Authorization, :get_read_authorizations, fn _, _, _, _ ->
+        {:error, :query_canceled,
+         %Postgrex.Error{postgres: %{code: :query_canceled, message: "canceling statement due to user request"}}}
+      end)
+
+      assert capture_log(fn ->
+               assert {:error, _} =
+                        subscribe_and_join(socket, "realtime:test", %{"config" => %{"private" => true}})
+             end) =~ "QueryCanceled"
+    end
+
+    test "missing partition during join logs MissingPartition", %{tenant: tenant} do
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{}, conn_opts(tenant, jwt))
+
+      expect(Authorization, :get_read_authorizations, fn _, _, _, _ -> {:error, :missing_partition} end)
+
+      assert capture_log(fn ->
+               assert {:error, _} =
+                        subscribe_and_join(socket, "realtime:test", %{"config" => %{"private" => true}})
+             end) =~ "MissingPartition"
     end
   end
 
@@ -854,6 +937,47 @@ defmodule RealtimeWeb.RealtimeChannelTest do
       clean_table(db_conn, "realtime", "messages")
 
       push(socket, "access_token", %{"access_token" => new_token})
+
+      # Channel closes
+      assert_process_down(socket.channel_pid)
+    end
+
+    @tag policies: [:authenticated_all_topic_read]
+    test "disconnects when only presence read permission is revoked on new access_token", %{tenant: tenant} do
+      jwt = Generators.generate_jwt_token(tenant)
+      {:ok, %Socket{} = socket} = connect(UserSocket, %{"log_level" => "warning"}, conn_opts(tenant, jwt))
+
+      assert socket =
+               subscribe_and_join!(socket, "realtime:test", %{
+                 "config" => %{"private" => true, "presence" => %{"enabled" => true}}
+               })
+
+      assert socket.assigns.policies == %Realtime.Tenants.Authorization.Policies{
+               broadcast: %Realtime.Tenants.Authorization.Policies.BroadcastPolicies{read: true, write: nil},
+               presence: %Realtime.Tenants.Authorization.Policies.PresencePolicies{read: true, write: nil}
+             }
+
+      new_token =
+        Generators.generate_jwt_token(tenant, %{
+          exp: System.system_time(:second) + 10_000,
+          role: "authenticated",
+          sub: "123"
+        })
+
+      assert new_token != jwt
+
+      # Replace policies so broadcast read is still allowed but presence read is revoked
+      {:ok, db_conn} = Realtime.Database.connect(tenant, "realtime_test")
+      clean_table(db_conn, "realtime", "messages")
+      create_rls_policies(db_conn, [:authenticated_read_broadcast], %{topic: "test"})
+
+      push(socket, "access_token", %{"access_token" => new_token})
+
+      assert_push "system", %{
+        extension: "system",
+        status: "error",
+        message: "You no longer have permission to read from this Channel topic: test"
+      }
 
       # Channel closes
       assert_process_down(socket.channel_pid)
@@ -1060,6 +1184,21 @@ defmodule RealtimeWeb.RealtimeChannelTest do
   end
 
   describe "access_token validations" do
+    test "access_token has exp and iat in decimal format", %{tenant: tenant} do
+      api_key = Generators.generate_jwt_token(tenant)
+
+      jwt =
+        Generators.generate_jwt_token(tenant, %{
+          role: "authenticated",
+          exp: System.system_time(:second) + 100.99,
+          iat: System.system_time(:second) - 100.99
+        })
+
+      assert {:ok, socket} = connect(UserSocket, %{}, conn_opts(tenant, api_key))
+
+      assert {:ok, _, _} = subscribe_and_join(socket, "realtime:test", %{"access_token" => jwt})
+    end
+
     test "access_token has expired", %{tenant: tenant} do
       api_key = Generators.generate_jwt_token(tenant)
       jwt = Generators.generate_jwt_token(tenant, %{role: "authenticated", exp: System.system_time(:second) - 1})
@@ -1390,7 +1529,7 @@ defmodule RealtimeWeb.RealtimeChannelTest do
           "settings" => %{
             "db_host" => "127.0.0.1",
             "db_name" => "postgres",
-            "db_user" => "supabase_admin",
+            "db_user" => "supabase_realtime_admin",
             "db_password" => "postgres",
             "poll_interval" => 100,
             "poll_max_changes" => 100,
@@ -1412,19 +1551,6 @@ defmodule RealtimeWeb.RealtimeChannelTest do
               %{reason: "DatabaseLackOfConnections: Database can't accept more connections, Realtime won't connect"}} =
                subscribe_and_join(socket, "realtime:test", %{"config" => %{"private" => true}})
     end
-  end
-
-  test "registers transport pid and channel pid per tenant", %{tenant: tenant} do
-    jwt = Generators.generate_jwt_token(tenant)
-    {:ok, %Socket{} = socket} = connect(UserSocket, %{"log_level" => "warning"}, conn_opts(tenant, jwt))
-
-    assert {:ok, _, %Socket{transport_pid: transport_pid_1} = socket} =
-             subscribe_and_join(socket, "realtime:#{random_string()}", %{})
-
-    assert {:ok, _, %Socket{transport_pid: ^transport_pid_1}} =
-             subscribe_and_join(socket, "realtime:#{random_string()}", %{})
-
-    assert [{_, ^transport_pid_1}] = Registry.lookup(RealtimeWeb.SocketDisconnect.Registry, tenant.external_id)
   end
 
   defp conn_opts(tenant, token) do

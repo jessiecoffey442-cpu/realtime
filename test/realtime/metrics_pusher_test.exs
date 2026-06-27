@@ -9,8 +9,10 @@ defmodule Realtime.MetricsPusherTest do
 
   # Helper function to start MetricsPusher and allow it to use Req.Test
   defp start_and_allow_pusher(opts) do
+    opts = Keyword.put(opts, :interval, :timer.minutes(5))
     pid = start_supervised!({MetricsPusher, opts})
     Req.Test.allow(MetricsPusher, self(), pid)
+    send(pid, :push)
     {:ok, pid}
   end
 
@@ -26,7 +28,6 @@ defmodule Realtime.MetricsPusherTest do
         user: "realtime",
         auth: "hunter2",
         compress: true,
-        interval: 10,
         timeout: 5000
       ]
 
@@ -57,8 +58,8 @@ defmodule Realtime.MetricsPusherTest do
       {:ok, _pid} = start_and_allow_pusher(opts)
 
       # Receive both request bodies
-      assert_receive {:req_called, body1}, 100
-      assert_receive {:req_called, body2}, 100
+      assert_receive {:req_called, body1}, 300
+      assert_receive {:req_called, body2}, 300
 
       global_metric = ~r/beam_stats_run_queue_count/
       tenant_metric = ~r/realtime_channel_input_bytes/
@@ -72,7 +73,6 @@ defmodule Realtime.MetricsPusherTest do
       opts = [
         url: "http://localhost:8428/api/v1/import/prometheus",
         compress: true,
-        interval: 10,
         timeout: 5000
       ]
 
@@ -86,8 +86,8 @@ defmodule Realtime.MetricsPusherTest do
       end)
 
       {:ok, _pid} = start_and_allow_pusher(opts)
-      assert_receive :req_called, 100
-      assert_receive :req_called, 100
+      assert_receive :req_called, 300
+      assert_receive :req_called, 300
     end
 
     test "sends request body untouched when compress=false" do
@@ -96,7 +96,6 @@ defmodule Realtime.MetricsPusherTest do
         user: "hunter2",
         auth: "realtime",
         compress: false,
-        interval: 10,
         timeout: 5000
       ]
 
@@ -111,8 +110,8 @@ defmodule Realtime.MetricsPusherTest do
       end)
 
       {:ok, _pid} = start_and_allow_pusher(opts)
-      assert_receive :req_called, 100
-      assert_receive :req_called, 100
+      assert_receive :req_called, 300
+      assert_receive :req_called, 300
     end
 
     test "when request receives non 2XX response" do
@@ -120,7 +119,6 @@ defmodule Realtime.MetricsPusherTest do
         url: "https://example.com:8428/api/v1/import/prometheus",
         auth: "hunter2",
         compress: true,
-        interval: 10,
         timeout: 5000
       ]
 
@@ -134,8 +132,8 @@ defmodule Realtime.MetricsPusherTest do
           end)
 
           {:ok, pid} = start_and_allow_pusher(opts)
-          assert_receive :req_called, 100
-          assert_receive :req_called, 100
+          assert_receive :req_called, 300
+          assert_receive :req_called, 300
           assert Process.alive?(pid)
           # Wait enough for the log to be captured
           Process.sleep(100)
@@ -143,12 +141,12 @@ defmodule Realtime.MetricsPusherTest do
 
       assert log =~ "MetricsPusher: Failed to push"
       assert log =~ "metrics to"
+      assert log =~ "error_code=MetricsPusherFailed"
     end
 
     test "when an error is raised" do
       opts = [
         url: "https://example.com:8428/api/v1/import/prometheus",
-        interval: 10,
         timeout: 5000
       ]
 
@@ -162,8 +160,8 @@ defmodule Realtime.MetricsPusherTest do
           end)
 
           {:ok, pid} = start_and_allow_pusher(opts)
-          assert_receive :req_called, 100
-          assert_receive :req_called, 100
+          assert_receive :req_called, 300
+          assert_receive :req_called, 300
           assert Process.alive?(pid)
           # Wait enough for the log to be captured
           Process.sleep(100)
@@ -171,13 +169,13 @@ defmodule Realtime.MetricsPusherTest do
 
       assert log =~ "MetricsPusher: Exception during"
       assert log =~ "push: %RuntimeError{message: \"unexpected error\"}"
+      assert log =~ "error_code=MetricsPusherException"
     end
 
     test "appends extra_label query params to URL" do
       opts = [
         url: "http://localhost:8428/api/v1/import/prometheus",
         compress: false,
-        interval: 10,
         timeout: 5000,
         extra_labels: [{"region", "us-east-1"}, {"env", "prod"}]
       ]
@@ -190,8 +188,8 @@ defmodule Realtime.MetricsPusherTest do
       end)
 
       {:ok, _pid} = start_and_allow_pusher(opts)
-      assert_receive {:req_called, query_string}, 100
-      assert_receive {:req_called, _}, 100
+      assert_receive {:req_called, query_string}, 300
+      assert_receive {:req_called, _}, 300
 
       decoded_params = query_string |> String.split("&") |> Enum.map(&URI.decode_www_form/1)
       assert "extra_label=region=us-east-1" in decoded_params
@@ -209,7 +207,6 @@ defmodule Realtime.MetricsPusherTest do
       {:ok, pid} =
         start_and_allow_pusher(
           url: "http://localhost:8428/api/v1/import/prometheus",
-          interval: 10,
           timeout: 5000
         )
 

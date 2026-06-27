@@ -1,11 +1,60 @@
 defmodule Extensions.PostgresCdcRls.ReplicationPoller do
   @moduledoc """
-  Polls the write ahead log, applies row level sucurity policies for each subscriber
-  and broadcast records to the `MessageDispatcher`.
+  Polls the write-ahead log via a temporary logical replication slot, applies row
+  level security policies for each subscriber, and broadcasts records to the
+  `MessageDispatcher`.
+
+  ## Lifecycle
+
+  On start the poller connects to the tenant's database and fetches the
+  publication's tables via `Subscriptions.fetch_publication_tables/2`. Only if
+  the publication has tables does it call `Replications.prepare_replication/2`
+  to create the temporary slot and kick off the poll loop; if the publication is
+  empty it stays idle without creating a slot (an unconsumed slot would retain
+  WAL) and waits for tables to appear.
+
+  ## Poll loop
+
+  Each `:poll` calls `Replications.list_changes/5`, which drains the slot and
+  fans changes out to subscriber nodes. Reschedule cadence depends on activity:
+
+    * rows processed → poll again immediately
+    * raw slot changes present but nothing for subscribers → poll after `poll_interval_ms` (+ jitter)
+    * fully idle → back off to `poll_interval_ms * @idle_multiplier`.
+
+  When the publication is empty, `:poll` is a no-op — there are no tables to
+  decode, so the slot is not advanced.
+
+  ## Reacting to publication changes
+
+  Every `@check_oids_interval` ms the poller re-fetches the publication's oids:
+
+    * tables appear (empty → non-empty): re-run `prepare_replication/1` to
+      recreate the slot if it was dropped, then resume polling.
+    * tables vanish (non-empty → empty): cancel pending polls and drop the
+      replication slot via `Replications.drop_replication_slot/2`. If the drop
+      fails for any reason other than `:slot_not_found`, the poller stops with
+      `{:shutdown, :drop_replication_slot_failed}`; because the slot is
+      temporary, Postgres releases it automatically when the DB connection
+      ends.
+
+  This mirrors `SubscriptionManager`'s own `:check_oids` loop, which manages
+  subscriptions when the publication's tables change.
   """
 
   use GenServer
   use Realtime.Logs
+
+  @idle_multiplier 5
+  @max_retries 6
+  @check_oids_interval 60_000
+
+  # Column order returned by realtime.list_changes/4 (see Replications.list_changes/5
+  # and the SQL function in
+  # lib/realtime/tenants/repo/migrations/20260326120000_list_changes_with_slot_count.ex).
+  # generate_record/1 below pattern-matches positionally on this order; the runtime
+  # check in handle_list_changes_result/4 fails loudly if the SQL ever changes.
+  @expected_columns ~w(type schema table columns record old_record commit_timestamp subscription_ids errors slot_changes_count)
 
   import Realtime.Helpers
 
@@ -13,6 +62,7 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
 
   alias Extensions.PostgresCdcRls.MessageDispatcher
   alias Extensions.PostgresCdcRls.Replications
+  alias Extensions.PostgresCdcRls.Subscriptions
 
   alias Realtime.Adapters.Changes.DeletedRecord
   alias Realtime.Adapters.Changes.NewRecord
@@ -37,6 +87,8 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
 
     RateCounter.new(rate_counter_args)
 
+    start_time = Realtime.Telemetry.start([:realtime, :replication, :poller], %{tenant: tenant_id})
+
     state = %{
       backoff: Backoff.new(backoff_min: 100, backoff_max: 5_000, backoff_type: :rand_exp),
       max_changes: extension["poll_max_changes"],
@@ -49,7 +101,10 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
       slot_name: extension["slot_name"] <> slot_name_suffix(),
       tenant_id: tenant_id,
       rate_counter_args: rate_counter_args,
-      subscribers_nodes_table: args["subscribers_nodes_table"]
+      subscribers_nodes_table: args["subscribers_nodes_table"],
+      start_time: start_time,
+      oids: %{},
+      check_oid_ref: nil
     }
 
     {:ok, _} = Registry.register(__MODULE__.Registry, tenant_id, %{})
@@ -57,23 +112,40 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
   end
 
   @impl true
-  def handle_continue({:connect, tenant}, state) do
-    realtime_rls_settings = Database.from_tenant(tenant, "realtime_rls")
+  def terminate(reason, %{start_time: start_time, tenant_id: tenant_id}) do
+    if reason in [:normal, :shutdown] or match?({:shutdown, _}, reason) do
+      Realtime.Telemetry.stop([:realtime, :replication, :poller], start_time, %{tenant: tenant_id, reason: reason})
+    else
+      Realtime.Telemetry.exception([:realtime, :replication, :poller], start_time, :exit, reason, [], %{
+        tenant: tenant_id
+      })
+    end
+  end
 
-    with {:ok, conn} <- Database.connect_db(realtime_rls_settings) do
+  def terminate(_reason, _state), do: :ok
+
+  @impl true
+  def handle_continue({:connect, tenant}, state) do
+    with {:ok, realtime_rls_settings} <- Database.from_tenant(tenant, "realtime_rls"),
+         {:ok, conn} <- Database.connect_db(realtime_rls_settings) do
       {:noreply, Map.put(state, :conn, conn), {:continue, :prepare}}
     else
       {:error, reason} ->
         log_error("ReplicationPollerConnectionFailed", reason)
-        {:stop, reason, state}
+        {:stop, {:shutdown, reason}, state}
     end
   end
 
   def handle_continue(:prepare, state) do
-    {:noreply, prepare_replication(state)}
+    prepare_replication(state)
   end
 
   @impl true
+  def handle_info(:poll, %{oids: oids, poll_ref: poll_ref} = state) when map_size(oids) == 0 do
+    cancel_timer(poll_ref)
+    {:noreply, %{state | poll_ref: nil}}
+  end
+
   def handle_info(
         :poll,
         %{
@@ -100,24 +172,34 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
     record_list_changes_telemetry(time, tenant_id)
 
     case handle_list_changes_result(list_changes, subscribers_nodes_table, tenant_id, rate_counter_args) do
-      {:ok, row_count} ->
-        Backoff.reset(backoff)
+      {:ok, {processed_count, slot_changes_count}} ->
+        backoff = Backoff.reset(backoff)
 
         pool_ref =
-          if row_count > 0 do
-            send(self(), :poll)
-            nil
-          else
-            jitter = Enum.random(50..100)
-            Process.send_after(self(), :poll, poll_interval_ms + jitter)
+          cond do
+            processed_count > 0 ->
+              send(self(), :poll)
+              nil
+
+            slot_changes_count > 0 ->
+              jitter = Enum.random(50..100)
+              Process.send_after(self(), :poll, poll_interval_ms + jitter)
+
+            true ->
+              Process.send_after(self(), :poll, poll_interval_ms * @idle_multiplier)
           end
 
-        {:noreply, %{state | backoff: backoff, poll_ref: pool_ref}}
+        {:noreply, %{state | backoff: backoff, poll_ref: pool_ref, retry_count: 0}}
 
-      {:error, %Postgrex.Error{postgres: %{code: :object_in_use, message: msg}}} ->
+      {:error, %Postgrex.Error{postgres: %{code: :object_in_use, message: msg}} = slot_error} ->
         log_error("ReplicationSlotBeingUsed", msg)
         [_, db_pid] = Regex.run(~r/PID\s(\d*)$/, msg)
         db_pid = String.to_integer(db_pid)
+
+        Realtime.Telemetry.execute([:realtime, :replication, :poller, :query, :exception], %{}, %{
+          tenant: tenant_id,
+          reason: :object_in_use
+        })
 
         case Replications.get_pg_stat_activity_diff(conn, db_pid) do
           {:ok, diff} ->
@@ -135,25 +217,78 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
           end
         end
 
-        {timeout, backoff} = Backoff.backoff(backoff)
-        retry_ref = Process.send_after(self(), :retry, timeout)
-
-        {:noreply, %{state | backoff: backoff, retry_ref: retry_ref, retry_count: retry_count + 1}}
+        retry_or_stop(state, slot_error)
 
       {:error, reason} ->
         log_error("PoolingReplicationError", reason)
 
-        {timeout, backoff} = Backoff.backoff(backoff)
-        retry_ref = Process.send_after(self(), :retry, timeout)
+        Realtime.Telemetry.execute([:realtime, :replication, :poller, :query, :exception], %{}, %{
+          tenant: tenant_id,
+          reason: reason
+        })
 
-        {:noreply, %{state | backoff: backoff, retry_ref: retry_ref, retry_count: retry_count + 1}}
+        retry_or_stop(state, reason)
     end
   end
 
   @impl true
   def handle_info(:retry, %{retry_ref: retry_ref} = state) do
     cancel_timer(retry_ref)
-    {:noreply, prepare_replication(state)}
+    prepare_replication(state)
+  end
+
+  def handle_info(:check_oids, %{conn: conn, publication: publication} = state) do
+    case Subscriptions.fetch_publication_tables(conn, publication) do
+      {:ok, new_oids} ->
+        check_oids(new_oids, state)
+
+      {:error, reason} ->
+        log_error("CheckOidsError", reason)
+        cancel_timer(state.check_oid_ref)
+        {:noreply, %{state | check_oid_ref: schedule_check_oids()}}
+    end
+  end
+
+  defp check_oids(new_oids, %{conn: conn, oids: old_oids} = state) do
+    case {map_size(old_oids), map_size(new_oids)} do
+      {0, n} when n > 0 ->
+        Logger.info("ReplicationPoller's publication went from 0 to #{n} tables, starting replication")
+        # prepare_replication/1 cancels check_oid_ref and reschedules it on success.
+        prepare_replication(%{state | oids: new_oids})
+
+      {n, 0} when n > 0 ->
+        Logger.info("ReplicationPoller's publication went from #{n} to 0 tables, stopping replication")
+        cancel_timer(state.poll_ref)
+        # Cancel any pending :retry too: a retry left over from a prior
+        # list_changes/5 error would otherwise fire after the slot is dropped and
+        # re-run prepare_replication/1, recreating work (and possibly the slot).
+        cancel_timer(state.retry_ref)
+
+        case Replications.drop_replication_slot(conn, state.slot_name) do
+          {:error, reason} when reason != :slot_not_found ->
+            # The slot is a temporary logical replication slot tied to this connection,
+            # so stopping the process releases it without leaking WAL.
+            log_error("DropReplicationSlotFailed", reason)
+            {:stop, {:shutdown, :drop_replication_slot_failed}, state}
+
+          _ ->
+            cancel_timer(state.check_oid_ref)
+
+            {:noreply,
+             %{
+               state
+               | oids: new_oids,
+                 poll_ref: nil,
+                 retry_ref: nil,
+                 retry_count: 0,
+                 check_oid_ref: schedule_check_oids()
+             }}
+        end
+
+      _ ->
+        cancel_timer(state.check_oid_ref)
+        {:noreply, %{state | oids: new_oids, check_oid_ref: schedule_check_oids()}}
+    end
   end
 
   def slot_name_suffix do
@@ -167,20 +302,71 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
 
   defp convert_errors(_), do: nil
 
-  defp prepare_replication(%{backoff: backoff, conn: conn, slot_name: slot_name, retry_count: retry_count} = state) do
-    case Replications.prepare_replication(conn, slot_name) do
-      {:ok, _} ->
-        send(self(), :poll)
-        state
+  defp prepare_replication(
+         %{
+           conn: conn,
+           slot_name: slot_name,
+           tenant_id: tenant_id,
+           publication: publication,
+           check_oid_ref: check_oid_ref
+         } = state
+       ) do
+    # Always fetch fresh publication information. An empty publication fails the
+    # map_size guard and falls through to the idle branch in `else`.
+    with {:ok, oids} when map_size(oids) > 0 <- Subscriptions.fetch_publication_tables(conn, publication),
+         {:ok, _} <- Replications.prepare_replication(conn, slot_name) do
+      send(self(), :poll)
+
+      cancel_timer(check_oid_ref)
+      # A successful prepare ends the failure streak: drop any pending retry and
+      # reset the backoff/retry_count so the next :poll error starts fresh rather
+      # than inheriting an inflated backoff or prematurely hitting @max_retries.
+      cancel_timer(state.retry_ref)
+
+      {:noreply,
+       %{
+         state
+         | oids: oids,
+           check_oid_ref: schedule_check_oids(),
+           retry_ref: nil,
+           retry_count: 0,
+           backoff: Backoff.reset(state.backoff)
+       }}
+    else
+      {:ok, oids} ->
+        # Empty publication: don't create a slot (it would retain WAL with nothing
+        # to consume it). Wait for :check_oids to observe tables appearing.
+        cancel_timer(check_oid_ref)
+        {:noreply, %{state | oids: oids, check_oid_ref: schedule_check_oids()}}
 
       {:error, error} ->
         log_error("PoolingReplicationPreparationError", error)
 
-        {timeout, backoff} = Backoff.backoff(backoff)
-        retry_ref = Process.send_after(self(), :retry, timeout)
-        %{state | backoff: backoff, retry_ref: retry_ref, retry_count: retry_count + 1}
+        Realtime.Telemetry.execute([:realtime, :replication, :poller, :prepare, :exception], %{}, %{
+          tenant: tenant_id,
+          reason: error
+        })
+
+        retry_or_stop(state, error)
     end
   end
+
+  # Schedules another :retry with exponential backoff, or stops the poller once
+  # @max_retries consecutive failures have been reached. Stopping with a
+  # :shutdown reason means the :transient child is NOT restarted (same as the
+  # DB-connection-failure path), so the tenant's CDC workers wind down cleanly.
+  defp retry_or_stop(%{retry_count: retry_count} = state, reason) when retry_count >= @max_retries do
+    log_error("ReplicationPollerMaxRetriesReached", reason)
+    {:stop, {:shutdown, :max_retries_reached}, state}
+  end
+
+  defp retry_or_stop(%{backoff: backoff, retry_count: retry_count} = state, _reason) do
+    {timeout, backoff} = Backoff.backoff(backoff)
+    retry_ref = Process.send_after(self(), :retry, timeout)
+    {:noreply, %{state | backoff: backoff, retry_ref: retry_ref, retry_count: retry_count + 1}}
+  end
+
+  defp schedule_check_oids, do: Process.send_after(self(), :check_oids, @check_oids_interval)
 
   defp record_list_changes_telemetry(time, tenant_id) do
     Realtime.Telemetry.execute(
@@ -194,22 +380,44 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
          {:ok,
           %Postgrex.Result{
             columns: columns,
-            rows: [_ | _] = rows,
-            num_rows: rows_count
+            rows: [_ | _] = rows
           }},
          subscribers_nodes_table,
          tenant_id,
          rate_counter_args
        ) do
+    expected_columns = @expected_columns
+    ^expected_columns = columns
+
+    # The DB function always returns at least one row (sentinel row with wal=null).
+    # All rows carry the same slot_changes_count in the last column.
+    slot_changes_count = rows |> List.first() |> List.last()
+
+    # The sentinel only appears when there are no real rows (see list_changes SQL).
+    # So either all rows are real, or the sole row is the sentinel — check once.
+    real_rows =
+      case rows do
+        [[nil | _] | _] -> []
+        _ -> rows
+      end
+
     case RateCounter.get(rate_counter_args) do
       {:ok, %{limit: %{triggered: true}}} ->
+        if real_rows != [] do
+          Realtime.Telemetry.execute(
+            [:realtime, :replication, :poller, :changes, :skip],
+            %{count: length(real_rows)},
+            %{tenant: tenant_id, reason: :rate_limited}
+          )
+        end
+
         :ok
 
       _ ->
-        for row <- rows,
-            change <- columns |> Enum.zip(row) |> generate_record() |> List.wrap() do
-          topic = "realtime:postgres:" <> tenant_id
+        topic = "realtime:postgres:" <> tenant_id
 
+        for row <- real_rows,
+            change <- row |> generate_record() |> List.wrap() do
           Realtime.GenCounter.add(rate_counter_args.id, MapSet.size(change.subscription_ids))
 
           payload = Jason.encode!(change)
@@ -240,23 +448,23 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
         end
     end
 
-    {:ok, rows_count}
+    {:ok, {length(real_rows), slot_changes_count}}
   end
 
-  defp handle_list_changes_result({:ok, _}, _, _, _), do: {:ok, 0}
+  defp handle_list_changes_result({:ok, _}, _, _, _), do: {:ok, {0, 0}}
   defp handle_list_changes_result({:error, reason}, _, _, _), do: {:error, reason}
 
   defp collect_subscription_nodes(subscribers_nodes_table, subscription_ids) do
     Enum.reduce_while(subscription_ids, {:ok, %{}}, fn subscription_id, {:ok, acc} ->
-      case :ets.lookup(subscribers_nodes_table, subscription_id) do
-        [{_, node}] ->
+      case :ets.lookup_element(subscribers_nodes_table, subscription_id, 2, :not_found) do
+        :not_found ->
+          {:halt, {:error, :node_not_found}}
+
+        node ->
           updated_acc =
             Map.update(acc, node, [subscription_id], fn existing_ids -> [subscription_id | existing_ids] end)
 
           {:cont, {:ok, updated_acc}}
-
-        _ ->
-          {:halt, {:error, :node_not_found}}
       end
     end)
   rescue
@@ -264,15 +472,16 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
   end
 
   def generate_record([
-        {"type", "INSERT" = type},
-        {"schema", schema},
-        {"table", table},
-        {"columns", columns},
-        {"record", record},
-        {"old_record", _},
-        {"commit_timestamp", commit_timestamp},
-        {"subscription_ids", subscription_ids},
-        {"errors", errors}
+        "INSERT" = type,
+        schema,
+        table,
+        columns,
+        record,
+        _old_record,
+        commit_timestamp,
+        subscription_ids,
+        errors,
+        _slot_changes_count
       ])
       when is_list(subscription_ids) do
     %NewRecord{
@@ -288,15 +497,16 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
   end
 
   def generate_record([
-        {"type", "UPDATE" = type},
-        {"schema", schema},
-        {"table", table},
-        {"columns", columns},
-        {"record", record},
-        {"old_record", old_record},
-        {"commit_timestamp", commit_timestamp},
-        {"subscription_ids", subscription_ids},
-        {"errors", errors}
+        "UPDATE" = type,
+        schema,
+        table,
+        columns,
+        record,
+        old_record,
+        commit_timestamp,
+        subscription_ids,
+        errors,
+        _slot_changes_count
       ])
       when is_list(subscription_ids) do
     %UpdatedRecord{
@@ -313,15 +523,16 @@ defmodule Extensions.PostgresCdcRls.ReplicationPoller do
   end
 
   def generate_record([
-        {"type", "DELETE" = type},
-        {"schema", schema},
-        {"table", table},
-        {"columns", columns},
-        {"record", _},
-        {"old_record", old_record},
-        {"commit_timestamp", commit_timestamp},
-        {"subscription_ids", subscription_ids},
-        {"errors", errors}
+        "DELETE" = type,
+        schema,
+        table,
+        columns,
+        _record,
+        old_record,
+        commit_timestamp,
+        subscription_ids,
+        errors,
+        _slot_changes_count
       ])
       when is_list(subscription_ids) do
     %DeletedRecord{

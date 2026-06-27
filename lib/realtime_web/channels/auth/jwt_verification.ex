@@ -2,8 +2,9 @@ defmodule RealtimeWeb.JwtVerification do
   @moduledoc """
   Parse JWT and verify claims
   """
+
   # Matching error in Dialyzer when using Joken.peek_claims/1 but {:ok, []} is actually possible and covered by our testing
-  @dialyzer {:nowarn_function, check_claims_format: 1}
+  @dialyzer {:no_match, check_claims_format: 1}
 
   defmodule JwtAuthToken do
     @moduledoc false
@@ -16,11 +17,16 @@ defmodule RealtimeWeb.JwtVerification do
         add_claim_validator(claims, claim_key, expected_val)
       end)
       |> add_claim_validator("exp")
+      |> add_claim_validator("iat")
     end
 
     defp add_claim_validator(claims, "exp") do
       current_time = current_time()
-      add_claim(claims, "exp", nil, &(&1 > current_time), message: current_time)
+      add_claim(claims, "exp", nil, &(is_number(&1) and &1 > current_time), message: current_time)
+    end
+
+    defp add_claim_validator(claims, "iat") do
+      add_claim(claims, "iat", nil, &is_number/1)
     end
 
     defp add_claim_validator(claims, claim_key, expected_val) do
@@ -40,8 +46,12 @@ defmodule RealtimeWeb.JwtVerification do
   def verify(token, jwt_secret, jwt_jwks) when is_binary(token) do
     with {:ok, _claims} <- check_claims_format(token),
          {:ok, header} <- check_header_format(token),
-         {:ok, signer} <- generate_signer(header, jwt_secret, jwt_jwks) do
-      JwtAuthToken.verify_and_validate(token, signer)
+         {:ok, signer} <- generate_signer(header, jwt_secret, jwt_jwks),
+         {:ok, claims} <- JwtAuthToken.verify_and_validate(token, signer) do
+      # JWT spec allows exp and iat to be a decimal number. This is uncommon
+      # though, so most implementation round them to integer to avoid unexpected
+      # type errors. So, we round it before returning.
+      {:ok, round_decimal_numbers(claims)}
     else
       {:error, _e} = error -> error
     end
@@ -61,6 +71,19 @@ defmodule RealtimeWeb.JwtVerification do
     case Joken.peek_header(token) do
       {:ok, header} when is_map(header) -> {:ok, header}
       _error -> {:error, :expected_header_map}
+    end
+  end
+
+  defp round_decimal_numbers(claims) do
+    claims
+    |> round_claim("exp")
+    |> round_claim("iat")
+  end
+
+  defp round_claim(claims, key) do
+    case Map.get(claims, key) do
+      value when is_number(value) -> Map.put(claims, key, round(value))
+      _ -> claims
     end
   end
 

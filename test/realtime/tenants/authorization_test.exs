@@ -2,8 +2,6 @@ defmodule Realtime.Tenants.AuthorizationTest do
   use RealtimeWeb.ConnCase, async: true
   use Mimic
 
-  require Phoenix.ChannelTest
-
   import ExUnit.CaptureLog
 
   alias Realtime.Api.Message
@@ -73,9 +71,10 @@ defmodule Realtime.Tenants.AuthorizationTest do
           presence_enabled?: false
         )
 
+      # presence.read is left unevaluated (nil) since presence was not checked; write is false.
       assert %Policies{
                broadcast: %BroadcastPolicies{read: true, write: true},
-               presence: %PresencePolicies{read: false, write: false}
+               presence: %PresencePolicies{read: nil, write: false}
              } == policies
     end
 
@@ -244,6 +243,101 @@ defmodule Realtime.Tenants.AuthorizationTest do
 
       {:ok, db_conn} = Database.connect(context.tenant, "realtime_test")
       assert {:ok, []} = Repo.all(db_conn, Message, Message)
+    end
+  end
+
+  describe "database error classification" do
+    @tag role: "anon", policies: []
+    test "invalid_parameter_value Postgrex error is classified as rls_policy_error", context do
+      stub(Database, :transaction, fn _, _, _, _ ->
+        {:error,
+         %Postgrex.Error{postgres: %{code: :invalid_parameter_value, message: "role \"super_admin\" does not exist"}}}
+      end)
+
+      assert {:error, :rls_policy_error, %Postgrex.Error{}} =
+               Authorization.get_read_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+
+      assert {:error, :rls_policy_error, %Postgrex.Error{}} =
+               Authorization.get_write_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+    end
+
+    @tag role: "anon", policies: []
+    test "query_canceled is classified as query_canceled", context do
+      query_canceled = %Postgrex.Error{
+        postgres: %{code: :query_canceled, message: "canceling statement due to user request"}
+      }
+
+      stub(Database, :transaction, fn _, _, _, _ ->
+        {:error, query_canceled}
+      end)
+
+      assert {:error, :query_canceled, %Postgrex.Error{}} =
+               Authorization.get_read_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+
+      assert {:error, :query_canceled, %Postgrex.Error{}} =
+               Authorization.get_write_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+    end
+
+    @tag role: "anon", policies: []
+    test "check_violation on messages is classified as missing_partition", context do
+      check_violation = %Postgrex.Error{
+        postgres: %{
+          code: :check_violation,
+          table: "messages",
+          message: "no partition of relation \"messages\" found for row"
+        }
+      }
+
+      stub(Database, :transaction, fn _, _, _, _ ->
+        {:error, check_violation}
+      end)
+
+      assert {:error, :missing_partition} =
+               Authorization.get_read_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+
+      assert {:error, :missing_partition} =
+               Authorization.get_write_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+    end
+
+    @tag role: "anon", policies: []
+    test "DBConnection.ConnectionError is classified as tenant_database_unavailable", context do
+      stub(Database, :transaction, fn _, _, _, _ ->
+        {:error, %DBConnection.ConnectionError{message: "ssl recv: closed", severity: :error, reason: :error}}
+      end)
+
+      assert {:error, :tenant_database_unavailable} =
+               Authorization.get_read_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+
+      assert {:error, :tenant_database_unavailable} =
+               Authorization.get_write_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+    end
+
+    @tag role: "anon", policies: []
+    test "ssl recv: closed ConnectionError from Repo on read is classified as tenant_database_unavailable", context do
+      conn_error = %DBConnection.ConnectionError{message: "ssl recv: closed", severity: :error, reason: :closed}
+      stub(Repo, :insert_all_entries, fn _, _, _ -> {:error, conn_error} end)
+
+      assert {:error, :tenant_database_unavailable} =
+               Authorization.get_read_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+    end
+
+    @tag role: "anon", policies: []
+    test "ssl recv: closed ConnectionError from Repo on write is classified as tenant_database_unavailable", context do
+      conn_error = %DBConnection.ConnectionError{message: "ssl recv: closed", severity: :error, reason: :closed}
+      stub(Repo, :insert, fn _, _, _, _ -> {:error, conn_error} end)
+
+      assert {:error, :tenant_database_unavailable} =
+               Authorization.get_write_authorizations(%Policies{}, context.db_conn, context.authorization_context)
+    end
+
+    @tag role: "anon", policies: []
+    test "ssl recv: closed ConnectionError from Repo.all on read is classified as tenant_database_unavailable",
+         context do
+      conn_error = %DBConnection.ConnectionError{message: "ssl recv: closed", severity: :error, reason: :closed}
+      stub(Repo, :all, fn _, _, _ -> {:error, conn_error} end)
+
+      assert {:error, :tenant_database_unavailable} =
+               Authorization.get_read_authorizations(%Policies{}, context.db_conn, context.authorization_context)
     end
   end
 

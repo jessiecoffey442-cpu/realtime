@@ -12,9 +12,6 @@ defmodule RealtimeWeb.BroadcastControllerTest do
   alias RealtimeWeb.Endpoint
   alias RealtimeWeb.TenantBroadcaster
 
-  @token "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpYXQiOjE1MTYyMzkwMjIsInJvbGUiOiJmb28iLCJleHAiOiJiYXIifQ.Ret2CevUozCsPhpgW2FMeFL7RooLgoOvfQzNpLBj5ak"
-  @expired_token "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3MjEwNzMyOTAsImlhdCI6MTYyNzg4NjQ0MCwicm9sZSI6ImFub24ifQ.AHmuaydSU3XAxwoIFhd3gwGwjnBIKsjFil0JQEOLtRw"
-
   setup %{conn: conn} do
     tenant = Containers.checkout_tenant(run_migrations: true)
     # Warm cache to avoid Cachex and Ecto.Sandbox ownership issues
@@ -175,6 +172,25 @@ defmodule RealtimeWeb.BroadcastControllerTest do
     end
   end
 
+  describe "suspended tenant" do
+    test "returns 403 and does not broadcast when tenant is suspended", %{conn: conn, tenant: tenant} do
+      Realtime.Tenants.Cache.update_cache(%{tenant | suspend: true})
+
+      reject(&TenantBroadcaster.pubsub_broadcast/5)
+
+      conn =
+        post(conn, Routes.broadcast_path(conn, :broadcast), %{
+          "messages" => [
+            %{"topic" => "sub_topic", "payload" => %{"data" => "data"}, "event" => "event"}
+          ]
+        })
+
+      assert conn.status == 403
+      assert conn.resp_body == Jason.encode!(%{message: "Tenant is suspended"})
+      assert calls(&TenantBroadcaster.pubsub_broadcast/5) == []
+    end
+  end
+
   describe "too many requests" do
     test "batch will exceed rate limit", %{conn: conn, tenant: tenant} do
       requests_rate = Tenants.requests_per_second_rate(tenant)
@@ -244,11 +260,14 @@ defmodule RealtimeWeb.BroadcastControllerTest do
     end
 
     test "expired token returns 401", %{conn: conn, tenant: tenant} do
+      now = System.system_time(:second)
+      expired_token = generate_jwt_token(tenant, %{role: "anon", iat: now - 200, exp: now - 100})
+
       conn =
         conn
         |> delete_req_header("authorization")
         |> put_req_header("accept", "application/json")
-        |> put_req_header("x-api-key", @expired_token)
+        |> put_req_header("x-api-key", expired_token)
         |> then(&%{&1 | host: "#{tenant.external_id}.supabase.com"})
 
       conn = post(conn, Routes.broadcast_path(conn, :broadcast), %{})
@@ -521,9 +540,12 @@ defmodule RealtimeWeb.BroadcastControllerTest do
   end
 
   defp generate_conn(conn, tenant) do
+    now = System.system_time(:second)
+    claims = %{role: "test", iat: now, exp: now + 100_000}
+
     conn
     |> put_req_header("accept", "application/json")
-    |> put_req_header("authorization", "Bearer #{@token}")
+    |> put_req_header("authorization", "Bearer #{generate_jwt_token(tenant, claims)}")
     |> then(&%{&1 | host: "#{tenant.external_id}.supabase.com"})
   end
 end
